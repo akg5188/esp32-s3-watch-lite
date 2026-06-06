@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "minimal_watch_main.c"
+        "watch_ai_cn_24.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp32_s3_touch_amoled_2_06
+        esp_driver_i2c
+        esp_http_server
+        esp_http_client
+        esp_codec_dev
+        esp_driver_i2s
+        esp_netif
+        esp_wifi
+        esp_event
+        esp_timer
+        json
+        mbedtls
+        nvs_flash
+)

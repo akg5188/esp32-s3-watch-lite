@@ -1,0 +1,66 @@
+services:
+  voice-gateway:
+    build:
+      context: .
+      dockerfile: tools/voice_gateway.Dockerfile
+    image: watch-voice-gateway:local
+    container_name: watch-voice-gateway
+    restart: unless-stopped
+    init: true
+    user: "${WATCH_VOICE_UID:-1000}:${WATCH_VOICE_GID:-1000}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    ports:
+      - "${WATCH_VOICE_BIND:-127.0.0.1}:8790:8790"
+    environment:
+      WATCH_VOICE_HOST: "0.0.0.0"
+      WATCH_VOICE_PORT: "8790"
+      WATCH_VOICE_TOKEN: "${WATCH_VOICE_TOKEN:-}"
+      WATCH_GATEWAY_API_URL: "${WATCH_GATEWAY_API_URL:-}"
+      WATCH_GATEWAY_API_KEY: "${WATCH_GATEWAY_API_KEY:-}"
+      WATCH_GATEWAY_MODEL: "${WATCH_GATEWAY_MODEL:-}"
+      WATCH_VOICE_STT_PROVIDER: "${WATCH_VOICE_STT_PROVIDER:-upstream}"
+      WATCH_VOICE_STT_MODEL: "${WATCH_VOICE_STT_MODEL:-whisper-1}"
+      WATCH_VOICE_TTS_PROVIDER: "${WATCH_VOICE_TTS_PROVIDER:-local}"
+      WATCH_VOICE_TTS_MODEL: "${WATCH_VOICE_TTS_MODEL:-tts-1}"
+      WATCH_VOICE_TTS_VOICE: "${WATCH_VOICE_TTS_VOICE:-zh-CN-XiaoxiaoNeural}"
+      WATCH_VOICE_TTS_SAMPLE_RATE: "${WATCH_VOICE_TTS_SAMPLE_RATE:-16000}"
+      WATCH_VOICE_WHISPER_MODEL: "${WATCH_VOICE_WHISPER_MODEL:-tiny}"
+      WATCH_VOICE_WHISPER_DEVICE: "${WATCH_VOICE_WHISPER_DEVICE:-cpu}"
+      WATCH_VOICE_WHISPER_COMPUTE: "${WATCH_VOICE_WHISPER_COMPUTE:-int8}"
+      WATCH_VOICE_PRELOAD_WHISPER: "${WATCH_VOICE_PRELOAD_WHISPER:-false}"
+      WATCH_VOICE_PRELOAD_TTS: "${WATCH_VOICE_PRELOAD_TTS:-false}"
+      WATCH_VOICE_TIMEOUT: "${WATCH_VOICE_TIMEOUT:-90}"
+      WATCH_VOICE_LOG_LEVEL: "${WATCH_VOICE_LOG_LEVEL:-INFO}"
+    volumes:
+      - ./tools/watch_gateway:/app/tools/watch_gateway
+      - voice_gateway_cache:/cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: watch-voice-cloudflared
+    restart: unless-stopped
+    profiles:
+      - tunnel
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      voice-gateway:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  voice_gateway_cache:

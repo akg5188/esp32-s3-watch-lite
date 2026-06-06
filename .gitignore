@@ -1,0 +1,31 @@
+# ESP-IDF build output and downloaded components
+/build/
+/build_*/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.voice-gateway.example
+tools/watch_gateway/watch_gateway_config.json
+
+# Runtime caches, logs and generated audio/debug files
+__pycache__/
+*.pyc
+*.log
+*.pid
+tools/watch_gateway/last_voice.*
+tools/watch_gateway/cache/
+.venv*/
+
+# Local backups and generated binaries
+/backups/
+*.bin
+*.elf
+*.map
+
+# Local screenshots/evaluation artifacts
+/eval_screenshots_*/
+/--help/

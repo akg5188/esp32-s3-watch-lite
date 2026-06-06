@@ -1,0 +1,5 @@
+watch_gateway_config.json
+*.log
+last_voice.*
+__pycache__/
+cache/
