@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_commands.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_io_additions.h"
 #include "esp_err.h"
@@ -385,6 +386,43 @@ esp_err_t bsp_display_backlight_on(void)
 {
     ESP_LOGI(TAG, "Backlight on");
     return bsp_display_brightness_set(100);
+}
+
+static esp_err_t bsp_display_qspi_cmd(uint8_t cmd)
+{
+    if (io_handle == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t lcd_cmd = cmd;
+    lcd_cmd &= 0xff;
+    lcd_cmd <<= 8;
+    lcd_cmd |= 0x02 << 24;
+    return esp_lcd_panel_io_tx_param(io_handle, lcd_cmd, NULL, 0);
+}
+
+esp_err_t bsp_display_panel_sleep(void)
+{
+    if (panel_handle == NULL || io_handle == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Panel sleep");
+    (void)bsp_display_brightness_set(0);
+    esp_err_t err = bsp_display_qspi_cmd(LCD_CMD_DISPOFF);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    err = bsp_display_qspi_cmd(LCD_CMD_SLPIN);
+    if (err == ESP_OK)
+    {
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    return err;
 }
 #if LVGL_VERSION_MAJOR >= 9
 static void rounder_event_cb(lv_event_t *e)

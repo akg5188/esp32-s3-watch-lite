@@ -106,6 +106,17 @@ esp_err_t bsp_display_backlight_on(void);
  */
 esp_err_t bsp_display_backlight_off(void);
 
+/**
+ * @brief Put the AMOLED controller into display-off sleep mode.
+ *
+ * This is stronger than brightness 0: the panel receives DISPOFF + SLPIN.
+ *
+ * @return
+ *      - ESP_OK on success
+ *      - ESP_ERR_INVALID_STATE if display is not initialized
+ */
+esp_err_t bsp_display_panel_sleep(void);
+
 #ifdef __cplusplus
 }
 #endif

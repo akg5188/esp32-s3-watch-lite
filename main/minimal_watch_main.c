@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "sdkconfig.h"
 #include "bsp/esp32_s3_touch_amoled_2_06.h"
 #include "cJSON.h"
 #include "esp_err.h"
@@ -30,6 +31,9 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#if CONFIG_BT_ENABLED
+#include "esp_bt.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #if CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
 #include "freertos/idf_additions.h"
@@ -37,6 +41,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "driver/i2c_master.h"
 #include "lvgl.h"
 #include "src/display/lv_display.h"
@@ -73,9 +78,18 @@ static bool s_ai_text_filter_enabled;
 #define MIN_MOTION_WAKE_THRESHOLD_MG 600
 #define MAX_MOTION_WAKE_THRESHOLD_MG 6000
 #define DEEP_SLEEP_ENABLED 1
+#define DEEP_SLEEP_AUTO_ENTER 0
+// Light sleep wakes from BOOT, but the touch I2C driver aborts after resume on this board.
+#define BUTTON_LIGHT_SLEEP_ENABLED 0
+#define AUTO_POWEROFF_ON_SLEEP 1
 #define DEEP_SLEEP_AFTER_SCREEN_OFF_S 15
 #define DEEP_SLEEP_BOOT_BUTTON_GPIO GPIO_NUM_0
+#define DEEP_SLEEP_POWER_BUTTON_GPIO GPIO_NUM_10
 #define BOOT_LONG_PRESS_CONFIG_AP_MS 2000
+#define BUSY_SLEEP_FORCE_RESET_MS 90000
+#define MARKET_BUSY_STALE_MS 65000
+#define CHART_BUSY_STALE_MS 65000
+#define TTS_BUSY_STALE_MS 90000
 
 #define MARKET_WAIT_INTERVAL_MS 2000
 #define DIRECT_HTTP_TIMEOUT_MS 12000
@@ -140,6 +154,7 @@ static bool s_ai_text_filter_enabled;
 #define QMI8658_CTRL2 0x03
 #define QMI8658_CTRL5 0x06
 #define QMI8658_CTRL7 0x08
+#define QMI8658_CTRL7_DISABLE 0x00
 #define QMI8658_RESET 0x60
 #define QMI8658_RST_RESULT 0x4D
 #define QMI8658_RST_RESULT_VALUE 0x80
@@ -150,9 +165,12 @@ static bool s_ai_text_filter_enabled;
 
 #define AXP2101_ADDR 0x34
 #define AXP2101_STATUS1 0x00
+#define AXP2101_STATUS2 0x01
 #define AXP2101_CHIP_ID 0x03
 #define AXP2101_CHIP_ID_VALUE_A 0x4A
 #define AXP2101_CHIP_ID_VALUE_B 0x47
+#define AXP2101_COMMON_CONFIG 0x10
+#define AXP2101_SOFT_SHUTDOWN_MASK (1u << 0)
 #define AXP2101_CHARGE_GAUGE_WDT_CTRL 0x18
 #define AXP2101_GAUGE_ENABLE_MASK (1u << 3)
 #define AXP2101_ADC_DATA_VBAT_H 0x34
@@ -162,6 +180,8 @@ static bool s_ai_text_filter_enabled;
 #define AXP2101_BAT_TYPE_DET_MASK (1u << 0)
 #define AXP2101_BAT_PRESENT_MASK (1u << 3)
 #define AXP2101_BAT_PERCENT_DATA 0xA4
+#define AXP2101_LDO_ONOFF_CTRL0 0x90
+#define AXP2101_ALDO2_ENABLE_MASK (1u << 1)
 
 #define WL_RETURN_ON_ERROR(expr, message) do {                         \
         esp_err_t wl_err__ = (expr);                                    \
@@ -403,6 +423,8 @@ typedef struct {
     bool market_polled_once;
     bool deep_sleep_armed;
     bool motion_worker_started;
+    volatile bool boot_wake_refresh_pending;
+    volatile bool boot_config_ap_pending;
     bool pmic_present;
     bool battery_present;
     bool imu_present;
@@ -418,6 +440,9 @@ typedef struct {
     int64_t screen_sleep_started_us;
     int64_t last_motion_wake_us;
     int64_t last_battery_read_us;
+    int64_t market_task_started_us;
+    int64_t chart_task_started_us;
+    int64_t tts_task_started_us;
     esp_netif_t *sta_netif;
     i2c_master_dev_handle_t pmic_dev;
     i2c_master_dev_handle_t imu_dev;
@@ -475,6 +500,8 @@ static void configure_timezone_once(void);
 static void home_market_refresh_async(void);
 static bool direct_ai_start_request(const char *source);
 static void chart_refresh_async(int row_index);
+static void handle_button_wake_refresh(void);
+static void process_pending_button_requests(void);
 static void motion_task_start_once(void);
 static void boot_button_task_start_once(void);
 static esp_err_t market_cache_load(void);
@@ -497,8 +524,13 @@ static esp_err_t wifi_configure_ap(void);
 static esp_err_t wifi_enable_config_ap(void);
 static esp_err_t http_server_start(void);
 static esp_err_t pmic_init(void);
+static esp_err_t pmic_read_reg(uint8_t reg, uint8_t *value);
+static esp_err_t pmic_update_bits(uint8_t reg, uint8_t mask, uint8_t value);
 static esp_err_t pmic_read_battery(void);
 static void battery_update_once(void);
+static void pmic_audio_power_set(bool enabled);
+static esp_err_t imu_write_reg(uint8_t reg, uint8_t value);
+static void log_wakeup_reason(void);
 static void update_ai_dialog_text(void);
 static bool ai_task_generation_is_current(uint32_t generation);
 static void ai_task_set_state_if_current(uint32_t generation, const char *state);
@@ -1544,6 +1576,49 @@ static void restore_display_brightness(void)
     (void)bsp_display_brightness_set(brightness);
 }
 
+static bool elapsed_ms_exceeded(int64_t started_us, int timeout_ms)
+{
+    if (started_us <= 0 || timeout_ms <= 0) {
+        return false;
+    }
+    return (esp_timer_get_time() - started_us) > ((int64_t)timeout_ms * 1000LL);
+}
+
+static void force_clear_stale_busy_flags(void)
+{
+    if (g_app.market_refresh_inflight &&
+        elapsed_ms_exceeded(g_app.market_task_started_us, MARKET_BUSY_STALE_MS)) {
+        ESP_LOGW(TAG, "sleep: clearing stale market task");
+        g_app.market_refresh_inflight = false;
+        g_app.market_task_started_us = 0;
+    }
+    if (g_app.chart_inflight &&
+        elapsed_ms_exceeded(g_app.chart_task_started_us, CHART_BUSY_STALE_MS)) {
+        ESP_LOGW(TAG, "sleep: clearing stale chart task");
+        g_app.chart_inflight = false;
+        g_app.chart_task_started_us = 0;
+    }
+    if (g_app.ai_start_inflight &&
+        elapsed_ms_exceeded(g_app.ai_task_started_us, BUSY_SLEEP_FORCE_RESET_MS)) {
+        ESP_LOGW(TAG, "sleep: clearing stale voice task");
+        g_app.ai_task_generation++;
+        g_app.ai_start_inflight = false;
+        g_app.ai_playback_inflight = false;
+        g_app.ai_tts_stop_requested = true;
+        g_app.ai_task_started_us = 0;
+        copy_string(g_app.ai_state, sizeof(g_app.ai_state), "READY");
+    }
+    if (g_app.ai_tts_inflight &&
+        elapsed_ms_exceeded(g_app.tts_task_started_us, TTS_BUSY_STALE_MS)) {
+        ESP_LOGW(TAG, "sleep: clearing stale tts task");
+        g_app.ai_tts_inflight = false;
+        g_app.ai_playback_inflight = false;
+        g_app.ai_tts_stop_requested = true;
+        g_app.tts_task_started_us = 0;
+        copy_string(g_app.ai_state, sizeof(g_app.ai_state), "READY");
+    }
+}
+
 static void enter_low_power_sleep(void)
 {
     (void)bsp_display_backlight_off();
@@ -1554,6 +1629,7 @@ static void enter_low_power_sleep(void)
 
 static bool app_busy_for_sleep(void)
 {
+    force_clear_stale_busy_flags();
     return g_app.market_refresh_inflight ||
            g_app.chart_inflight ||
            g_app.ai_start_inflight ||
@@ -1561,26 +1637,171 @@ static bool app_busy_for_sleep(void)
            g_app.ai_playback_inflight;
 }
 
-static void enter_deep_sleep_now(void)
+static void audio_shutdown_for_sleep(void)
 {
-#if DEEP_SLEEP_ENABLED
-    ESP_LOGI(TAG, "deep sleep: entering, button wake only");
+    bool lock_taken = false;
+    if (g_app.audio_lock) {
+        lock_taken = xSemaphoreTake(g_app.audio_lock, pdMS_TO_TICKS(200)) == pdTRUE;
+    }
+    if (lock_taken && g_app.mic_dev) {
+        (void)esp_codec_dev_close(g_app.mic_dev);
+    }
+    if (lock_taken && g_app.speaker_dev) {
+        (void)esp_codec_dev_close(g_app.speaker_dev);
+    }
+    gpio_set_level(BSP_POWER_AMP_IO, 0);
+    gpio_reset_pin(BSP_I2S_MCLK);
+    gpio_reset_pin(BSP_I2S_SCLK);
+    gpio_reset_pin(BSP_I2S_LCLK);
+    gpio_reset_pin(BSP_I2S_DOUT);
+    gpio_reset_pin(BSP_I2S_DSIN);
+    pmic_audio_power_set(false);
+    if (lock_taken) {
+        xSemaphoreGive(g_app.audio_lock);
+    }
+}
+
+static void imu_shutdown_for_sleep(void)
+{
+    if (g_app.imu_present && g_app.imu_dev) {
+        (void)imu_write_reg(QMI8658_CTRL7, QMI8658_CTRL7_DISABLE);
+        g_app.imu_baseline_valid = false;
+    }
+}
+
+static void pmic_prepare_for_deep_sleep(void)
+{
+    if (!g_app.pmic_present) {
+        return;
+    }
+    (void)pmic_update_bits(AXP2101_CHARGE_GAUGE_WDT_CTRL, AXP2101_GAUGE_ENABLE_MASK, 0);
+    (void)pmic_update_bits(AXP2101_LDO_ONOFF_CTRL0, AXP2101_ALDO2_ENABLE_MASK, 0);
+}
+
+static void pmic_audio_power_set(bool enabled)
+{
+    if (!g_app.pmic_present) {
+        return;
+    }
+    (void)pmic_update_bits(AXP2101_LDO_ONOFF_CTRL0, AXP2101_ALDO2_ENABLE_MASK,
+                           enabled ? AXP2101_ALDO2_ENABLE_MASK : 0);
+    if (enabled) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void enter_poweroff_now(void)
+{
+    if (!AUTO_POWEROFF_ON_SLEEP) {
+        return;
+    }
+    if (!g_app.pmic_present) {
+        ESP_LOGW(TAG, "poweroff: PMIC not present, staying in standby");
+        return;
+    }
+    if (g_app.deep_sleep_armed) {
+        return;
+    }
+
     g_app.deep_sleep_armed = true;
     (void)market_cache_save();
-    (void)bsp_display_backlight_off();
+
+    uint8_t status1 = 0;
+    uint8_t status2 = 0;
+    bool vbus_good = pmic_read_reg(AXP2101_STATUS1, &status1) == ESP_OK && (status1 & (1u << 5));
+    bool vbus_in = pmic_read_reg(AXP2101_STATUS2, &status2) == ESP_OK && ((status2 & (1u << 3)) == 0) && vbus_good;
+    ESP_LOGI(TAG, "poweroff: idle timeout, AXP2101 soft shutdown vbus=%d status1=0x%02X status2=0x%02X",
+             vbus_in ? 1 : 0, status1, status2);
+
+    esp_err_t err = pmic_update_bits(AXP2101_COMMON_CONFIG,
+                                     AXP2101_SOFT_SHUTDOWN_MASK,
+                                     AXP2101_SOFT_SHUTDOWN_MASK);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "poweroff: shutdown request failed: %s", esp_err_to_name(err));
+        g_app.deep_sleep_armed = false;
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    ESP_LOGW(TAG, "poweroff: PMIC did not cut power, staying in standby");
+}
+
+static void wifi_shutdown_for_deep_sleep(void)
+{
     wifi_sta_disconnect_now();
-    gpio_set_level(BSP_POWER_AMP_IO, 0);
+    if (!g_app.wifi_started) {
+        return;
+    }
     (void)esp_wifi_stop();
-    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    gpio_config_t boot_btn = {
-        .pin_bit_mask = 1ULL << DEEP_SLEEP_BOOT_BUTTON_GPIO,
+    (void)esp_wifi_deinit();
+    g_app.wifi_started = false;
+    g_app.sta_connected = false;
+    g_app.pending_wifi_slot = -1;
+    g_app.active_wifi_slot = -1;
+    g_app.sta_ip[0] = '\0';
+}
+
+static void hardware_prepare_for_deep_sleep(void)
+{
+    ESP_LOGI(TAG, "deep sleep: hardware shutdown");
+    g_app.ai_tts_stop_requested = true;
+    audio_shutdown_for_sleep();
+    imu_shutdown_for_sleep();
+    (void)bsp_display_panel_sleep();
+    wifi_shutdown_for_deep_sleep();
+    pmic_prepare_for_deep_sleep();
+#if CONFIG_BT_ENABLED
+    (void)esp_bt_controller_disable();
+    (void)esp_bt_controller_deinit();
+#endif
+}
+
+static void configure_power_button_gpio_for_sleep(void)
+{
+    gpio_config_t power_btn = {
+        .pin_bit_mask = 1ULL << DEEP_SLEEP_POWER_BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    (void)gpio_config(&boot_btn);
-    (void)esp_sleep_enable_ext1_wakeup(1ULL << DEEP_SLEEP_BOOT_BUTTON_GPIO, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_err_t err = gpio_config(&power_btn);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep: power key gpio config failed: %s", esp_err_to_name(err));
+    }
+    (void)gpio_sleep_sel_dis(DEEP_SLEEP_POWER_BUTTON_GPIO);
+
+    if (rtc_gpio_is_valid_gpio(DEEP_SLEEP_POWER_BUTTON_GPIO)) {
+        (void)rtc_gpio_hold_dis(DEEP_SLEEP_POWER_BUTTON_GPIO);
+        err = rtc_gpio_init(DEEP_SLEEP_POWER_BUTTON_GPIO);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "deep sleep: power key rtc init failed: %s", esp_err_to_name(err));
+        }
+        (void)rtc_gpio_set_direction(DEEP_SLEEP_POWER_BUTTON_GPIO, RTC_GPIO_MODE_INPUT_ONLY);
+        (void)rtc_gpio_set_direction_in_sleep(DEEP_SLEEP_POWER_BUTTON_GPIO, RTC_GPIO_MODE_INPUT_ONLY);
+        (void)rtc_gpio_pullup_dis(DEEP_SLEEP_POWER_BUTTON_GPIO);
+        (void)rtc_gpio_pulldown_dis(DEEP_SLEEP_POWER_BUTTON_GPIO);
+    }
+    (void)esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    ESP_LOGI(TAG, "deep sleep: PWR wake gpio=%d level=%d",
+             (int)DEEP_SLEEP_POWER_BUTTON_GPIO, gpio_get_level(DEEP_SLEEP_POWER_BUTTON_GPIO));
+}
+
+static void enter_deep_sleep_now(void)
+{
+#if DEEP_SLEEP_ENABLED
+    ESP_LOGI(TAG, "deep sleep: entering, PWR key wake only");
+    g_app.deep_sleep_armed = true;
+    (void)market_cache_save();
+    hardware_prepare_for_deep_sleep();
+    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    (void)esp_sleep_disable_ext1_wakeup_io(0);
+    configure_power_button_gpio_for_sleep();
+    esp_err_t wake_err = esp_sleep_enable_ext1_wakeup_io(1ULL << DEEP_SLEEP_POWER_BUTTON_GPIO,
+                                                         ESP_EXT1_WAKEUP_ANY_HIGH);
+    if (wake_err != ESP_OK) {
+        ESP_LOGW(TAG, "deep sleep: PWR ext1 wake failed: %s", esp_err_to_name(wake_err));
+    }
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_deep_sleep_start();
 #endif
@@ -1597,6 +1818,7 @@ static void set_sleeping(bool sleeping)
         g_app.deep_sleep_armed = false;
         g_app.screen_sleep_started_us = g_app.last_activity_us;
         enter_low_power_sleep();
+        enter_poweroff_now();
     } else {
         g_app.deep_sleep_armed = false;
         g_app.screen_sleep_started_us = 0;
@@ -2096,9 +2318,59 @@ static void ui_refresh_now(void)
     bsp_display_unlock();
 }
 
+static bool enter_button_light_sleep_if_ready(void)
+{
+    if (!BUTTON_LIGHT_SLEEP_ENABLED || DEEP_SLEEP_AUTO_ENTER ||
+        !g_app.screen_sleeping || app_busy_for_sleep() ||
+        g_app.boot_wake_refresh_pending || g_app.boot_config_ap_pending) {
+        return false;
+    }
+
+    if (gpio_get_level(DEEP_SLEEP_BOOT_BUTTON_GPIO) == 0) {
+        g_app.last_activity_us = esp_timer_get_time();
+        g_app.boot_wake_refresh_pending = true;
+        return true;
+    }
+
+    esp_err_t err = gpio_wakeup_enable(DEEP_SLEEP_BOOT_BUTTON_GPIO, GPIO_INTR_LOW_LEVEL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "light sleep: BOOT gpio wake enable failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    err = esp_sleep_enable_gpio_wakeup();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "light sleep: gpio wake source enable failed: %s", esp_err_to_name(err));
+        (void)gpio_wakeup_disable(DEEP_SLEEP_BOOT_BUTTON_GPIO);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "light sleep: entering, BOOT/GPIO%d low wakes",
+             (int)DEEP_SLEEP_BOOT_BUTTON_GPIO);
+    int64_t before_us = esp_timer_get_time();
+    err = esp_light_sleep_start();
+    int64_t slept_ms = (esp_timer_get_time() - before_us) / 1000;
+
+    (void)gpio_wakeup_disable(DEEP_SLEEP_BOOT_BUTTON_GPIO);
+    (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "light sleep: start failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "light sleep: woke cause=%d boot=%d slept=%lldms",
+             (int)esp_sleep_get_wakeup_cause(),
+             gpio_get_level(DEEP_SLEEP_BOOT_BUTTON_GPIO),
+             (long long)slept_ms);
+    g_app.last_activity_us = esp_timer_get_time();
+    g_app.boot_wake_refresh_pending = true;
+    return true;
+}
+
 static void ui_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    process_pending_button_requests();
     ui_refresh_now();
 
     int64_t now_us = esp_timer_get_time();
@@ -2116,12 +2388,17 @@ static void ui_timer_cb(lv_timer_t *timer)
         }
     }
 
-    if (g_app.screen_sleeping && !g_app.deep_sleep_armed && !app_busy_for_sleep()) {
+    if (DEEP_SLEEP_AUTO_ENTER && g_app.screen_sleeping && !g_app.deep_sleep_armed && !app_busy_for_sleep()) {
         int64_t sleep_start_us = g_app.screen_sleep_started_us ? g_app.screen_sleep_started_us : g_app.last_activity_us;
         int64_t sleep_us = now_us - sleep_start_us;
         if (sleep_us >= (int64_t)DEEP_SLEEP_AFTER_SCREEN_OFF_S * 1000000LL) {
             enter_deep_sleep_now();
         }
+    }
+
+    if (enter_button_light_sleep_if_ready()) {
+        process_pending_button_requests();
+        ui_refresh_now();
     }
 }
 
@@ -2452,6 +2729,66 @@ static void motion_task_start_once(void)
     xTaskCreate(motion_task, "motion_wake", 4096, NULL, 3, NULL);
 }
 
+static void power_button_gpio_prepare_active(void)
+{
+    if (rtc_gpio_is_valid_gpio(DEEP_SLEEP_POWER_BUTTON_GPIO)) {
+        (void)rtc_gpio_hold_dis(DEEP_SLEEP_POWER_BUTTON_GPIO);
+        (void)rtc_gpio_deinit(DEEP_SLEEP_POWER_BUTTON_GPIO);
+    }
+    (void)gpio_sleep_sel_dis(DEEP_SLEEP_POWER_BUTTON_GPIO);
+    gpio_config_t power_btn = {
+        .pin_bit_mask = 1ULL << DEEP_SLEEP_POWER_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    (void)gpio_config(&power_btn);
+}
+
+static void handle_button_wake_refresh(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    if (g_app.screen_sleeping) {
+        wake_screen_for_input();
+    } else {
+        g_app.last_activity_us = now_us;
+    }
+    if (g_app.chart_screen && lv_screen_active() == g_app.chart_screen &&
+        g_app.chart_selected_index >= 0) {
+        chart_refresh_async(g_app.chart_selected_index);
+    } else {
+        ui_show_home();
+        home_market_refresh_async();
+    }
+}
+
+static void process_pending_button_requests(void)
+{
+    bool config_ap_pending = g_app.boot_config_ap_pending;
+    bool wake_refresh_pending = g_app.boot_wake_refresh_pending;
+
+    if (!config_ap_pending && !wake_refresh_pending) {
+        return;
+    }
+
+    g_app.boot_config_ap_pending = false;
+    g_app.boot_wake_refresh_pending = false;
+
+    if (config_ap_pending) {
+        ESP_LOGI(TAG, "boot button: handle config AP on UI task");
+        g_app.last_activity_us = esp_timer_get_time();
+        if (g_app.screen_sleeping) {
+            wake_screen_for_input();
+        }
+        (void)wifi_enable_config_ap();
+        return;
+    }
+
+    ESP_LOGI(TAG, "boot button: handle wake and refresh on UI task");
+    handle_button_wake_refresh();
+}
+
 static void boot_button_task(void *arg)
 {
     (void)arg;
@@ -2464,7 +2801,9 @@ static void boot_button_task(void *arg)
     };
     (void)gpio_config(&boot_btn);
 
-    int last_level = 1;
+    int last_level = gpio_get_level(DEEP_SLEEP_BOOT_BUTTON_GPIO);
+    ESP_LOGI(TAG, "boot button: active gpio=%d initial=%d",
+             (int)DEEP_SLEEP_BOOT_BUTTON_GPIO, last_level);
     int64_t press_start_us = 0;
     bool long_press_handled = false;
     while (true) {
@@ -2477,31 +2816,17 @@ static void boot_button_task(void *arg)
             if (held_ms >= BOOT_LONG_PRESS_CONFIG_AP_MS) {
                 long_press_handled = true;
                 g_app.last_activity_us = esp_timer_get_time();
-                ESP_LOGI(TAG, "boot button: long press, enable config AP");
-                if (g_app.screen_sleeping) {
-                    wake_screen_for_input();
-                }
-                (void)wifi_enable_config_ap();
-                ui_refresh_now();
+                ESP_LOGI(TAG, "boot button: long press, request config AP");
+                g_app.boot_config_ap_pending = true;
             }
         } else if (last_level == 0 && level == 1) {
             int64_t now_us = esp_timer_get_time();
             int64_t held_ms = press_start_us > 0 ? (now_us - press_start_us) / 1000 : 0;
             press_start_us = 0;
             if (!long_press_handled && held_ms >= 60) {
-                ESP_LOGI(TAG, "boot button: wake and refresh");
-                if (g_app.screen_sleeping) {
-                    wake_screen_for_input();
-                } else {
-                    g_app.last_activity_us = now_us;
-                }
-                if (g_app.chart_screen && lv_screen_active() == g_app.chart_screen &&
-                    g_app.chart_selected_index >= 0) {
-                    chart_refresh_async(g_app.chart_selected_index);
-                } else {
-                    ui_show_home();
-                    home_market_refresh_async();
-                }
+                ESP_LOGI(TAG, "boot button: wake and refresh requested");
+                g_app.last_activity_us = now_us;
+                g_app.boot_wake_refresh_pending = true;
             }
         }
         last_level = level;
@@ -2512,6 +2837,40 @@ static void boot_button_task(void *arg)
 static void boot_button_task_start_once(void)
 {
     xTaskCreate(boot_button_task, "boot_button", 3072, NULL, 3, NULL);
+}
+
+static const char *wake_cause_name(esp_sleep_wakeup_cause_t cause)
+{
+    switch (cause) {
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+        return "undefined";
+    case ESP_SLEEP_WAKEUP_EXT0:
+        return "ext0";
+    case ESP_SLEEP_WAKEUP_EXT1:
+        return "ext1";
+    case ESP_SLEEP_WAKEUP_TIMER:
+        return "timer";
+    case ESP_SLEEP_WAKEUP_TOUCHPAD:
+        return "touch";
+    case ESP_SLEEP_WAKEUP_ULP:
+        return "ulp";
+    case ESP_SLEEP_WAKEUP_GPIO:
+        return "gpio";
+    case ESP_SLEEP_WAKEUP_UART:
+        return "uart";
+    default:
+        return "other";
+    }
+}
+
+static void log_wakeup_reason(void)
+{
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    uint64_t ext1_mask = esp_sleep_get_ext1_wakeup_status();
+    ESP_LOGI(TAG, "wake cause: %s(%d) ext1=0x%llx boot=%d pwr=%d",
+             wake_cause_name(cause), (int)cause, (unsigned long long)ext1_mask,
+             gpio_get_level(DEEP_SLEEP_BOOT_BUTTON_GPIO),
+             gpio_get_level(DEEP_SLEEP_POWER_BUTTON_GPIO));
 }
 
 static void update_ai_dialog_text(void)
@@ -3721,11 +4080,14 @@ static esp_err_t record_voice_wav(binary_buffer_t *wav_out, char *error_out, siz
     if (g_app.audio_lock) {
         xSemaphoreTake(g_app.audio_lock, portMAX_DELAY);
     }
+    pmic_audio_power_set(true);
 
     if (!g_app.mic_dev) {
         g_app.mic_dev = bsp_audio_codec_microphone_init();
     }
     if (!g_app.mic_dev) {
+        pmic_audio_power_set(false);
+        gpio_set_level(BSP_POWER_AMP_IO, 0);
         if (g_app.audio_lock) {
             xSemaphoreGive(g_app.audio_lock);
         }
@@ -3753,6 +4115,8 @@ static esp_err_t record_voice_wav(binary_buffer_t *wav_out, char *error_out, siz
     };
     int open_ret = esp_codec_dev_open(g_app.mic_dev, &capture_fs);
     if (open_ret != ESP_CODEC_DEV_OK) {
+        pmic_audio_power_set(false);
+        gpio_set_level(BSP_POWER_AMP_IO, 0);
         if (g_app.audio_lock) {
             xSemaphoreGive(g_app.audio_lock);
         }
@@ -3909,6 +4273,7 @@ static esp_err_t record_voice_wav(binary_buffer_t *wav_out, char *error_out, siz
 
     esp_codec_dev_close(g_app.mic_dev);
     gpio_set_level(BSP_POWER_AMP_IO, 0);
+    pmic_audio_power_set(false);
     if (g_app.audio_lock) {
         xSemaphoreGive(g_app.audio_lock);
     }
@@ -3966,10 +4331,13 @@ static esp_err_t play_wav_audio(uint8_t *data, size_t len, char *error_out, size
     if (g_app.audio_lock) {
         xSemaphoreTake(g_app.audio_lock, portMAX_DELAY);
     }
+    pmic_audio_power_set(true);
     if (!g_app.speaker_dev) {
         g_app.speaker_dev = bsp_audio_codec_speaker_init();
     }
     if (!g_app.speaker_dev) {
+        pmic_audio_power_set(false);
+        gpio_set_level(BSP_POWER_AMP_IO, 0);
         if (g_app.audio_lock) {
             xSemaphoreGive(g_app.audio_lock);
         }
@@ -3983,6 +4351,8 @@ static esp_err_t play_wav_audio(uint8_t *data, size_t len, char *error_out, size
     build_wav_sample_info(&wav, &fs);
     int open_ret = esp_codec_dev_open(g_app.speaker_dev, &fs);
     if (open_ret != ESP_CODEC_DEV_OK) {
+        pmic_audio_power_set(false);
+        gpio_set_level(BSP_POWER_AMP_IO, 0);
         if (g_app.audio_lock) {
             xSemaphoreGive(g_app.audio_lock);
         }
@@ -4023,6 +4393,7 @@ static esp_err_t play_wav_audio(uint8_t *data, size_t len, char *error_out, size
 
     esp_codec_dev_close(g_app.speaker_dev);
     gpio_set_level(BSP_POWER_AMP_IO, 0);
+    pmic_audio_power_set(false);
     if (g_app.audio_lock) {
         xSemaphoreGive(g_app.audio_lock);
     }
@@ -4320,6 +4691,7 @@ static void home_market_refresh_task(void *arg)
     if (net_err != ESP_OK) {
         copy_string(g_app.market_status, sizeof(g_app.market_status), "NO WIFI");
         g_app.market_refresh_inflight = false;
+        g_app.market_task_started_us = 0;
         wifi_sta_disconnect_when_idle();
         if (g_app.net_lock) {
             xSemaphoreGive(g_app.net_lock);
@@ -4335,6 +4707,7 @@ static void home_market_refresh_task(void *arg)
     if (!body) {
         copy_string(g_app.market_status, sizeof(g_app.market_status), "NO MEM");
         g_app.market_refresh_inflight = false;
+        g_app.market_task_started_us = 0;
         wifi_sta_disconnect_when_idle();
         if (g_app.net_lock) {
             xSemaphoreGive(g_app.net_lock);
@@ -4397,6 +4770,7 @@ static void home_market_refresh_task(void *arg)
 
     http_body_free(body);
     g_app.market_refresh_inflight = false;
+    g_app.market_task_started_us = 0;
     wifi_sta_disconnect_when_idle();
     if (g_app.net_lock) {
         xSemaphoreGive(g_app.net_lock);
@@ -4444,9 +4818,11 @@ static void home_market_refresh_async(void)
     }
     g_app.last_market_refresh_us = now_us;
     g_app.market_refresh_inflight = true;
+    g_app.market_task_started_us = now_us;
     copy_string(g_app.market_status, sizeof(g_app.market_status), "Starting");
     if (xTaskCreate(home_market_refresh_task, "home_market", 12288, NULL, 4, NULL) != pdPASS) {
         g_app.market_refresh_inflight = false;
+        g_app.market_task_started_us = 0;
         copy_string(g_app.market_status, sizeof(g_app.market_status), "NO TASK");
     }
 }
@@ -4589,6 +4965,7 @@ finish:
         xSemaphoreGive(g_app.net_lock);
     }
     g_app.ai_tts_inflight = false;
+    g_app.tts_task_started_us = 0;
     g_app.ai_tts_stop_requested = false;
     ui_refresh_now();
     free(job);
@@ -4621,6 +4998,7 @@ static bool schedule_tts_reply(const char *reply)
     copy_ai_text(job->reply, sizeof(job->reply), reply);
 
     g_app.ai_tts_inflight = true;
+    g_app.tts_task_started_us = esp_timer_get_time();
     copy_string(g_app.ai_state, sizeof(g_app.ai_state), "TTS");
     ui_refresh_now();
 
@@ -4639,6 +5017,7 @@ static bool schedule_tts_reply(const char *reply)
     }
     if (task_ok != pdPASS) {
         g_app.ai_tts_inflight = false;
+        g_app.tts_task_started_us = 0;
         free(job);
         copy_string(g_app.ai_state, sizeof(g_app.ai_state), "TTS ERR");
         log_voice_task_heap("tts task create failed");
@@ -5256,6 +5635,7 @@ static void chart_refresh_task(void *arg)
     int row_index = (int)(uintptr_t)arg;
     if (row_index < 0 || row_index >= MARKET_ROW_COUNT) {
         g_app.chart_inflight = false;
+        g_app.chart_task_started_us = 0;
         vTaskDelete(NULL);
         return;
     }
@@ -5270,6 +5650,7 @@ static void chart_refresh_task(void *arg)
     if (net_err != ESP_OK) {
         copy_string(g_app.chart_hint, sizeof(g_app.chart_hint), "NO WIFI");
         g_app.chart_inflight = false;
+        g_app.chart_task_started_us = 0;
         wifi_sta_disconnect_when_idle();
         if (g_app.net_lock) {
             xSemaphoreGive(g_app.net_lock);
@@ -5285,6 +5666,7 @@ static void chart_refresh_task(void *arg)
     if (!body) {
         copy_string(g_app.chart_hint, sizeof(g_app.chart_hint), "NO MEM");
         g_app.chart_inflight = false;
+        g_app.chart_task_started_us = 0;
         wifi_sta_disconnect_when_idle();
         if (g_app.net_lock) {
             xSemaphoreGive(g_app.net_lock);
@@ -5315,6 +5697,7 @@ static void chart_refresh_task(void *arg)
 
     http_body_free(body);
     g_app.chart_inflight = false;
+    g_app.chart_task_started_us = 0;
     wifi_sta_disconnect_when_idle();
     if (g_app.net_lock) {
         xSemaphoreGive(g_app.net_lock);
@@ -5335,9 +5718,16 @@ static void chart_refresh_async(int row_index)
     }
     g_app.chart_selected_index = row_index;
     g_app.chart_inflight = true;
+    g_app.chart_task_started_us = esp_timer_get_time();
     copy_string(g_app.chart_hint, sizeof(g_app.chart_hint), "Starting");
     ui_refresh_locked();
-    xTaskCreate(chart_refresh_task, "chart_refresh", 12288, (void *)(uintptr_t)row_index, 4, NULL);
+    if (xTaskCreate(chart_refresh_task, "chart_refresh", 12288,
+                    (void *)(uintptr_t)row_index, 4, NULL) != pdPASS) {
+        g_app.chart_inflight = false;
+        g_app.chart_task_started_us = 0;
+        copy_string(g_app.chart_hint, sizeof(g_app.chart_hint), "NO TASK");
+        ui_refresh_locked();
+    }
 }
 
 static void html_escape(const char *src, char *dst, size_t dst_size)
@@ -6923,6 +7313,8 @@ void app_main(void)
     };
     (void)gpio_config(&amp_gpio);
     gpio_set_level(BSP_POWER_AMP_IO, 0);
+    power_button_gpio_prepare_active();
+    log_wakeup_reason();
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
