@@ -31,6 +31,8 @@ API Key: 火山方舟 API Key
 Model: 方舟控制台里启用的豆包模型或 endpoint id
 ```
 
+首页左右两侧有多个 AI 快捷入口：`GPT`、`Gem`、`豆包`、`DS`、`千问`、`自定`。配置网页里每个 AI 都可以保存独立的 API URL、API Key 和 Model；点击首页入口会切换到对应 AI 后进入聊天页。
+
 语音链路可以直接走中转站，也可以用 `tools/voice_gateway.py` 或 Docker 语音网关做 ASR/TTS/联网资料整理。
 
 ## 配置热点

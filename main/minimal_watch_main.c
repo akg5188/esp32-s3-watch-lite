@@ -68,6 +68,10 @@ static bool s_ai_text_filter_enabled;
 #define DEFAULT_VOICE_GATEWAY_URL "http://127.0.0.1:8790"
 #define DEFAULT_API_URL "https://ai.orbitlink.me/v1"
 #define DEFAULT_MODEL "gpt-5.4"
+#define AI_PROFILE_COUNT 6
+#define AI_PROFILE_CUSTOM_INDEX 5
+#define AI_PROFILE_MAGIC 0x41495031u
+#define AI_PROFILE_VERSION 1u
 #define DEFAULT_MARKET_PROVIDER "coingecko"
 #define DEFAULT_STARTER_PROMPT "用中文简短回复：手表 AI 聊天已经启动，请问我可以帮你什么？"
 #define DEFAULT_AUTO_SLEEP_S 45
@@ -198,6 +202,20 @@ typedef struct {
     char dns1[16];
     char dns2[16];
 } wifi_ip_config_t;
+
+typedef struct {
+    char name[16];
+    char server_url[160];
+    char api_key[192];
+    char model[64];
+} ai_profile_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    int active_index;
+    ai_profile_t profiles[AI_PROFILE_COUNT];
+} ai_profile_store_t;
 
 typedef struct {
     uint32_t magic;
@@ -467,6 +485,7 @@ typedef struct {
     char ai_user[192];
     char ai_reply[512];
     char ai_dialog[896];
+    ai_profile_store_t ai_profiles;
 
     lv_obj_t *home_screen;
     lv_obj_t *ai_screen;
@@ -485,9 +504,43 @@ typedef struct {
     lv_obj_t *ai_state_label;
     lv_obj_t *ai_reply_container;
     lv_obj_t *ai_reply_label;
+    lv_obj_t *ai_profile_label;
 } app_state_t;
 
 static app_state_t g_app;
+
+static const ai_profile_t DEFAULT_AI_PROFILES[AI_PROFILE_COUNT] = {
+    {
+        .name = "GPT",
+        .server_url = "https://api.openai.com/v1",
+        .model = "gpt-4o-mini",
+    },
+    {
+        .name = "Gemini",
+        .server_url = "https://generativelanguage.googleapis.com/v1beta/openai",
+        .model = "gemini-2.5-flash",
+    },
+    {
+        .name = "豆包",
+        .server_url = "https://ark.cn-beijing.volces.com/api/v3",
+        .model = "doubao-seed-1-6",
+    },
+    {
+        .name = "DeepSeek",
+        .server_url = "https://api.deepseek.com/v1",
+        .model = "deepseek-chat",
+    },
+    {
+        .name = "千问",
+        .server_url = "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        .model = "qwen-plus",
+    },
+    {
+        .name = "自定",
+        .server_url = DEFAULT_API_URL,
+        .model = DEFAULT_MODEL,
+    },
+};
 
 static void ui_refresh_now(void);
 static void ui_refresh_locked(void);
@@ -507,6 +560,8 @@ static void boot_button_task_start_once(void);
 static esp_err_t market_cache_load(void);
 static esp_err_t market_cache_save(void);
 static esp_err_t config_save(const watch_lite_config_t *cfg);
+static esp_err_t ai_profiles_save(const ai_profile_store_t *store);
+static void ai_profile_apply(int index, bool persist);
 static void config_sanitize(watch_lite_config_t *cfg);
 static bool config_has_wifi(const watch_lite_config_t *cfg);
 static void apply_ip_config_for_slot(int slot);
@@ -1037,6 +1092,137 @@ static bool config_has_wifi(const watch_lite_config_t *cfg)
     return false;
 }
 
+static void ai_profiles_set_defaults(ai_profile_store_t *store)
+{
+    memset(store, 0, sizeof(*store));
+    store->magic = AI_PROFILE_MAGIC;
+    store->version = AI_PROFILE_VERSION;
+    store->active_index = AI_PROFILE_CUSTOM_INDEX;
+    for (int i = 0; i < AI_PROFILE_COUNT; i++) {
+        copy_string(store->profiles[i].name, sizeof(store->profiles[i].name),
+                    DEFAULT_AI_PROFILES[i].name);
+        copy_string(store->profiles[i].server_url, sizeof(store->profiles[i].server_url),
+                    DEFAULT_AI_PROFILES[i].server_url);
+        copy_string(store->profiles[i].model, sizeof(store->profiles[i].model),
+                    DEFAULT_AI_PROFILES[i].model);
+    }
+}
+
+static void ai_profiles_import_current_config(ai_profile_store_t *store,
+                                              const watch_lite_config_t *cfg)
+{
+    if (!store || !cfg) {
+        return;
+    }
+    ai_profile_t *custom = &store->profiles[AI_PROFILE_CUSTOM_INDEX];
+    copy_string(custom->server_url, sizeof(custom->server_url), cfg->server_url);
+    copy_string(custom->api_key, sizeof(custom->api_key), cfg->api_key);
+    copy_string(custom->model, sizeof(custom->model), cfg->model);
+}
+
+static void ai_profiles_sanitize(ai_profile_store_t *store)
+{
+    if (!store || store->magic != AI_PROFILE_MAGIC || store->version != AI_PROFILE_VERSION) {
+        return;
+    }
+    if (store->active_index < 0 || store->active_index >= AI_PROFILE_COUNT) {
+        store->active_index = AI_PROFILE_CUSTOM_INDEX;
+    }
+    for (int i = 0; i < AI_PROFILE_COUNT; i++) {
+        ai_profile_t *profile = &store->profiles[i];
+        profile->name[sizeof(profile->name) - 1] = '\0';
+        profile->server_url[sizeof(profile->server_url) - 1] = '\0';
+        profile->api_key[sizeof(profile->api_key) - 1] = '\0';
+        profile->model[sizeof(profile->model) - 1] = '\0';
+        if (profile->name[0] == '\0') {
+            copy_string(profile->name, sizeof(profile->name), DEFAULT_AI_PROFILES[i].name);
+        }
+        if (profile->server_url[0] == '\0') {
+            copy_string(profile->server_url, sizeof(profile->server_url),
+                        DEFAULT_AI_PROFILES[i].server_url);
+        }
+        if (profile->model[0] == '\0') {
+            copy_string(profile->model, sizeof(profile->model),
+                        DEFAULT_AI_PROFILES[i].model);
+        }
+    }
+}
+
+static esp_err_t ai_profiles_load(ai_profile_store_t *store, const watch_lite_config_t *cfg)
+{
+    ai_profiles_set_defaults(store);
+    ai_profiles_import_current_config(store, cfg);
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(APP_NS, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ai profiles load: open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    size_t size = 0;
+    err = nvs_get_blob(handle, "ai_profiles", NULL, &size);
+    if (err == ESP_OK && size == sizeof(*store)) {
+        err = nvs_get_blob(handle, "ai_profiles", store, &size);
+        if (err == ESP_OK && store->magic == AI_PROFILE_MAGIC &&
+            store->version == AI_PROFILE_VERSION) {
+            ai_profiles_sanitize(store);
+            nvs_close(handle);
+            ESP_LOGI(TAG, "ai profiles load: stored active=%d", store->active_index);
+            return ESP_OK;
+        }
+    }
+    nvs_close(handle);
+
+    ai_profiles_set_defaults(store);
+    ai_profiles_import_current_config(store, cfg);
+    ESP_LOGI(TAG, "ai profiles load: defaults err=%s size=%u",
+             esp_err_to_name(err), (unsigned)size);
+    (void)ai_profiles_save(store);
+    return err;
+}
+
+static esp_err_t ai_profiles_save(const ai_profile_store_t *store)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(APP_NS, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_blob(handle, "ai_profiles", store, sizeof(*store));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static const ai_profile_t *ai_profile_active(void)
+{
+    int index = g_app.ai_profiles.active_index;
+    if (index < 0 || index >= AI_PROFILE_COUNT) {
+        index = AI_PROFILE_CUSTOM_INDEX;
+    }
+    return &g_app.ai_profiles.profiles[index];
+}
+
+static void ai_profile_apply(int index, bool persist)
+{
+    if (index < 0 || index >= AI_PROFILE_COUNT) {
+        index = AI_PROFILE_CUSTOM_INDEX;
+    }
+    g_app.ai_profiles.active_index = index;
+    const ai_profile_t *profile = ai_profile_active();
+    copy_string(g_app.cfg.server_url, sizeof(g_app.cfg.server_url), profile->server_url);
+    copy_string(g_app.cfg.api_key, sizeof(g_app.cfg.api_key), profile->api_key);
+    copy_string(g_app.cfg.model, sizeof(g_app.cfg.model), profile->model);
+    config_sanitize(&g_app.cfg);
+    if (persist) {
+        (void)ai_profiles_save(&g_app.ai_profiles);
+        (void)config_save(&g_app.cfg);
+    }
+}
+
 static void config_set_defaults(watch_lite_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -1445,9 +1631,11 @@ static int wifi_preferred_slot_load(void)
 
 static void log_config_summary(void)
 {
-    ESP_LOGI(TAG, "config summary: wifi_slots=%d preferred=%d auto_sleep=%d api=%s model=%s",
+    const ai_profile_t *profile = ai_profile_active();
+    ESP_LOGI(TAG, "config summary: wifi_slots=%d preferred=%d auto_sleep=%d ai=%s api=%s model=%s",
              configured_wifi_slot_count(), g_app.preferred_wifi_slot,
-             g_app.cfg.auto_sleep_s, g_app.cfg.api_key[0] ? "set" : "empty",
+             g_app.cfg.auto_sleep_s, profile->name,
+             g_app.cfg.api_key[0] ? "set" : "empty",
              g_app.cfg.model);
     for (int slot = 0; slot < WIFI_SLOT_COUNT; slot++) {
         const char *ssid = config_wifi_ssid_const(&g_app.cfg, slot);
@@ -1913,6 +2101,11 @@ static void home_action_cb(lv_event_t *event)
     if (action == 1) {
         ESP_LOGI(TAG, "home action: show AI");
         ui_show_ai();
+    } else if (action >= 100 && action < 100 + AI_PROFILE_COUNT) {
+        int profile_index = (int)(action - 100);
+        ESP_LOGI(TAG, "home action: AI profile %d", profile_index);
+        ai_profile_apply(profile_index, true);
+        ui_show_ai();
     }
 }
 
@@ -2065,7 +2258,13 @@ static void ui_create_home(void)
                             (void *)(uintptr_t)i);
     }
 
-    make_button(scr, "AI", 344, 228, 58, 44, 0x1C755C, home_action_cb, (void *)1);
+    make_button(scr, "GPT", 8, 58, 60, 34, 0x2255A4, home_action_cb, (void *)100);
+    make_button(scr, "Gem", 8, 104, 60, 34, 0x167C7B, home_action_cb, (void *)101);
+    make_button(scr, "豆包", 8, 150, 60, 34, 0x8A4E1D, home_action_cb, (void *)102);
+    make_button(scr, "DS", 344, 58, 58, 34, 0x1B5D78, home_action_cb, (void *)103);
+    make_button(scr, "千问", 344, 104, 58, 34, 0x5C4FA3, home_action_cb, (void *)104);
+    make_button(scr, "自定", 344, 150, 58, 34, 0x31523E, home_action_cb, (void *)105);
+    g_app.ai_profile_label = make_label_font(scr, "自定", 346, 198, 58, 0x91A3BF, AI_DIALOG_FONT);
     g_app.home_screen = scr;
 }
 
@@ -2088,7 +2287,7 @@ static void ui_create_ai(void)
     lv_obj_set_style_border_color(box, lv_color_hex(0x1B2638), 0);
     lv_obj_add_event_cb(box, activity_event_cb, LV_EVENT_ALL, NULL);
 
-    g_app.ai_title_label = make_label_font(scr, "AI", 24, 18, 120, 0x46E09F, &lv_font_montserrat_28);
+    g_app.ai_title_label = make_label_font(scr, "AI", 24, 18, 160, 0x46E09F, AI_DIALOG_FONT);
     g_app.ai_state_label = make_wrap_label_font(scr, "状态：READY", 34, 68, 342, 42,
                                                 0xD8E7FF, AI_DIALOG_FONT);
     lv_obj_set_style_text_line_space(g_app.ai_state_label, 4, 0);
@@ -2264,6 +2463,11 @@ static void ui_refresh_locked(void)
         lv_label_set_text(g_app.market_status_label, g_app.market_status);
     }
 
+    const ai_profile_t *active_profile = ai_profile_active();
+    if (g_app.ai_profile_label) {
+        lv_label_set_text(g_app.ai_profile_label, active_profile->name);
+    }
+
     if (g_app.status_label) {
         if (g_app.sta_connected) {
             lv_label_set_text_fmt(g_app.status_label, "%s", g_app.sta_ip);
@@ -2274,6 +2478,9 @@ static void ui_refresh_locked(void)
         }
     }
     if (g_app.ai_state_label || g_app.ai_reply_label) {
+        if (g_app.ai_title_label) {
+            lv_label_set_text(g_app.ai_title_label, active_profile->name);
+        }
         if (g_app.ai_state_label) {
             lv_label_set_text_fmt(g_app.ai_state_label, "状态：%s",
                                   g_app.ai_state[0] ? g_app.ai_state : "READY");
@@ -3064,6 +3271,7 @@ static void build_api_endpoint_url(const char *endpoint_path, char *out, size_t 
     static const char *const api_base_paths[] = {
         "/v1",
         "/api/v3",
+        "/v1beta/openai",
     };
     for (size_t i = 0; i < sizeof(api_base_paths) / sizeof(api_base_paths[0]); ++i) {
         const char *api_base_path = api_base_paths[i];
@@ -5897,8 +6105,8 @@ static esp_err_t index_get_handler(httpd_req_t *req)
     char slot_gateway[WIFI_SLOT_COUNT][32] = {{0}};
     char slot_dns1[WIFI_SLOT_COUNT][32] = {{0}};
     char slot_dns2[WIFI_SLOT_COUNT][32] = {{0}};
-    char api_url[224] = {0};
-    char model[96] = {0};
+    char ai_url[AI_PROFILE_COUNT][224] = {{0}};
+    char ai_model[AI_PROFILE_COUNT][96] = {{0}};
     char prompt[256] = {0};
     char market_provider[32] = {0};
     char proxy_host[96] = {0};
@@ -5909,8 +6117,12 @@ static esp_err_t index_get_handler(httpd_req_t *req)
     html_escape(config_wifi_ssid_const(&g_app.cfg, 2), ssid3, sizeof(ssid3));
     html_escape(config_wifi_ssid_const(&g_app.cfg, 3), ssid4, sizeof(ssid4));
     html_escape(config_wifi_ssid_const(&g_app.cfg, 4), ssid5, sizeof(ssid5));
-    html_escape(g_app.cfg.server_url, api_url, sizeof(api_url));
-    html_escape(g_app.cfg.model, model, sizeof(model));
+    for (int i = 0; i < AI_PROFILE_COUNT; i++) {
+        html_escape(g_app.ai_profiles.profiles[i].server_url,
+                    ai_url[i], sizeof(ai_url[i]));
+        html_escape(g_app.ai_profiles.profiles[i].model,
+                    ai_model[i], sizeof(ai_model[i]));
+    }
     html_escape(g_app.cfg.starter_prompt, prompt, sizeof(prompt));
     html_escape(g_app.cfg.market_provider, market_provider, sizeof(market_provider));
     for (int i = 0; i < WIFI_SLOT_COUNT; i++) {
@@ -6054,11 +6266,44 @@ static esp_err_t index_get_handler(httpd_req_t *req)
         }
     }
 
-    err = httpd_sendf_chunk(req,
+    err = httpd_resp_sendstr_chunk(req,
         "<h3>AI</h3>"
-        "<label>API URL</label><input name='api_url' maxlength='159' value=\"%s\" placeholder='https://example.com/v1 or https://ark.cn-beijing.volces.com/api/v3'>"
-        "<label>API Key</label><input name='api_key' maxlength='191' type='password' placeholder='blank = keep old key'>"
-        "<label>Model</label><input name='model' maxlength='63' value=\"%s\">"
+        "<label>首页默认 AI</label><select name='ai_profile'>");
+    if (err != ESP_OK) {
+        return err;
+    }
+    for (int i = 0; i < AI_PROFILE_COUNT; i++) {
+        err = httpd_sendf_chunk(req, "<option value='%d' %s>%s%s</option>",
+                                i + 1,
+                                g_app.ai_profiles.active_index == i ? "selected" : "",
+                                g_app.ai_profiles.profiles[i].name,
+                                g_app.ai_profiles.profiles[i].api_key[0] ? " / key set" : "");
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    err = httpd_resp_sendstr_chunk(req, "</select>");
+    if (err != ESP_OK) {
+        return err;
+    }
+    for (int i = 0; i < AI_PROFILE_COUNT; i++) {
+        err = httpd_sendf_chunk(req,
+            "<div class='slot'><div class='slotHead'><b>%s</b><span class='pill'>%s</span></div>"
+            "<label>API URL</label><input name='ai_url%d' maxlength='159' value=\"%s\" "
+            "placeholder='https://example.com/v1'>"
+            "<label>API Key</label><input name='ai_key%d' maxlength='191' type='password' "
+            "placeholder='blank = keep old key'>"
+            "<label>Model</label><input name='ai_model%d' maxlength='63' value=\"%s\"></div>",
+            g_app.ai_profiles.profiles[i].name,
+            g_app.ai_profiles.profiles[i].api_key[0] ? "key set" : "no key",
+            i + 1, ai_url[i],
+            i + 1,
+            i + 1, ai_model[i]);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    err = httpd_sendf_chunk(req,
         "<label>AI Prompt</label><textarea name='starter_prompt' maxlength='159'>%s</textarea>"
         "<label>Market</label><select name='market_provider'>"
         "<option value='coingecko' %s>coingecko</option><option value='mock' %s>mock</option></select>"
@@ -6073,7 +6318,7 @@ static esp_err_t index_get_handler(httpd_req_t *req)
         "<label>Shake Threshold mg</label><input name='motion_threshold' type='number' min='%d' max='%d' value='%d'>"
         "<button type='submit'>Save and Reboot</button></form>"
         "<div class='card muted warn'>静态 IP/Gateway/DNS 仍按原逻辑保存；WiFi 扫描和 Switch 不需要外网。</div>",
-        api_url, model, prompt,
+        prompt,
         strcasecmp(market_provider, "coingecko") == 0 ? "selected" : "",
         strcasecmp(market_provider, "mock") == 0 ? "selected" : "",
         proxy_host, g_app.cfg.proxy_port, g_app.cfg.auto_sleep_s,
@@ -6178,8 +6423,11 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     body[received] = '\0';
 
     watch_lite_config_t next = g_app.cfg;
+    ai_profile_store_t next_profiles = g_app.ai_profiles;
     next.magic = CONFIG_MAGIC;
     next.version = CONFIG_VERSION;
+    next_profiles.magic = AI_PROFILE_MAGIC;
+    next_profiles.version = AI_PROFILE_VERSION;
 
     char *work = malloc(strlen(body) + 1);
     char value[256] = {0};
@@ -6248,9 +6496,36 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     }
     form_update_string_if_present(body, "ssid", next.wifi_ssid, sizeof(next.wifi_ssid), false);
     form_update_string_if_present(body, "password", next.wifi_password, sizeof(next.wifi_password), true);
-    form_update_string(body, "api_url", next.server_url, sizeof(next.server_url), true);
-    form_update_string(body, "api_key", next.api_key, sizeof(next.api_key), true);
-    form_update_string(body, "model", next.model, sizeof(next.model), true);
+    for (int i = 0; i < AI_PROFILE_COUNT; i++) {
+        char url_key[16] = {0};
+        char api_key_key[16] = {0};
+        char model_key[18] = {0};
+        snprintf(url_key, sizeof(url_key), "ai_url%d", i + 1);
+        snprintf(api_key_key, sizeof(api_key_key), "ai_key%d", i + 1);
+        snprintf(model_key, sizeof(model_key), "ai_model%d", i + 1);
+        form_update_string_if_present(body, url_key, next_profiles.profiles[i].server_url,
+                                      sizeof(next_profiles.profiles[i].server_url), true);
+        form_update_string_if_present(body, api_key_key, next_profiles.profiles[i].api_key,
+                                      sizeof(next_profiles.profiles[i].api_key), true);
+        form_update_string_if_present(body, model_key, next_profiles.profiles[i].model,
+                                      sizeof(next_profiles.profiles[i].model), true);
+    }
+    strcpy(work, body);
+    form_get_value(work, "ai_profile", value, sizeof(value));
+    if (value[0]) {
+        int requested_profile = atoi(value) - 1;
+        next_profiles.active_index = (requested_profile >= 0 &&
+                                      requested_profile < AI_PROFILE_COUNT) ?
+                                     requested_profile : AI_PROFILE_CUSTOM_INDEX;
+    }
+    ai_profiles_sanitize(&next_profiles);
+    const ai_profile_t *active_profile = &next_profiles.profiles[next_profiles.active_index];
+    copy_string(next.server_url, sizeof(next.server_url), active_profile->server_url);
+    copy_string(next.api_key, sizeof(next.api_key), active_profile->api_key);
+    copy_string(next.model, sizeof(next.model), active_profile->model);
+    form_update_string_if_present(body, "api_url", next.server_url, sizeof(next.server_url), true);
+    form_update_string_if_present(body, "api_key", next.api_key, sizeof(next.api_key), true);
+    form_update_string_if_present(body, "model", next.model, sizeof(next.model), true);
     form_update_string(body, "starter_prompt", next.starter_prompt, sizeof(next.starter_prompt), true);
     form_update_string(body, "market_provider", next.market_provider, sizeof(next.market_provider), true);
     form_update_string(body, "static_ip", next.static_ip, sizeof(next.static_ip), false);
@@ -6321,6 +6596,12 @@ static esp_err_t save_post_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save failed");
         return ESP_FAIL;
     }
+    err = ai_profiles_save(&next_profiles);
+    if (err != ESP_OK) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save ai profiles failed");
+        return ESP_FAIL;
+    }
     err = wifi_preferred_slot_save(next_preferred_slot);
     if (err != ESP_OK) {
         free(body);
@@ -6329,6 +6610,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     }
 
     g_app.cfg = next;
+    g_app.ai_profiles = next_profiles;
     g_app.sta_configured = config_has_wifi(&g_app.cfg);
     g_app.preferred_wifi_slot = next_preferred_slot;
     free(body);
@@ -6361,7 +6643,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
              "\"active_wifi_slot\":%d,\"active_wifi_ssid\":\"%s\","
              "\"preferred_wifi_slot\":%d,\"preferred_wifi_ssid\":\"%s\","
              "\"active_static_ip\":\"%s\",\"active_gateway\":\"%s\",\"active_dns1\":\"%s\","
-             "\"api_url\":\"%s\",\"api_key_set\":%s,\"model\":\"%s\","
+             "\"ai_profile\":\"%s\",\"api_url\":\"%s\",\"api_key_set\":%s,\"model\":\"%s\","
              "\"auto_sleep_s\":%d,\"brightness_percent\":%d,"
              "\"motion_wake_enabled\":%d,\"motion_wake_threshold_mg\":%d,"
              "\"market_polled_once\":%s,\"ai_state\":\"%s\",\"ai_elapsed_ms\":%d,"
@@ -6376,6 +6658,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
              active_net ? active_net->static_ip : "",
              active_net ? active_net->static_gateway : "",
              active_net ? active_net->dns1 : "",
+             ai_profile_active()->name,
              g_app.cfg.server_url,
              g_app.cfg.api_key[0] ? "true" : "false",
              g_app.cfg.model,
@@ -7338,6 +7621,8 @@ void app_main(void)
     }
 
     config_load(&g_app.cfg);
+    (void)ai_profiles_load(&g_app.ai_profiles, &g_app.cfg);
+    ai_profile_apply(g_app.ai_profiles.active_index, false);
     make_ap_ssid();
     app_state_set_defaults();
     log_config_summary();
