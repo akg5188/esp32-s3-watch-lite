@@ -34,6 +34,27 @@ idf.py -B build_lite build
 build_lite/watch_ai.bin
 ```
 
+## 从 GitHub Release 下载固件
+
+发布版会附带自动构建的固件包：
+
+```text
+watch_ai-esp32s3-merged.bin       合并固件，推荐直接刷 0x0
+watch_ai-esp32s3-firmware.zip     完整固件包，包含 bootloader / 分区表 / app / 刷机说明
+bootloader.bin                    单独 bootloader
+partition-table.bin               单独分区表
+watch_ai.bin                      单独 app 固件
+FLASHING.txt                      本次 release 对应的刷机命令
+```
+
+优先使用合并固件：
+
+```bash
+python -m esptool --chip esp32s3 -p /dev/ttyACM0 -b 460800 \
+  --before default_reset --after hard_reset write_flash \
+  0x0 watch_ai-esp32s3-merged.bin
+```
+
 ## 刷机
 
 ```bash

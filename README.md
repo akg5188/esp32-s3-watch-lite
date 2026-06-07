@@ -45,6 +45,13 @@ cd "/path/to/ESP32-S3 Watch"
 idf.py -B build_lite -p /dev/ttyACM0 flash monitor
 ```
 
+如果是从 GitHub Release 下载固件，优先使用发布附件里的合并固件：
+
+```bash
+python -m esptool --chip esp32s3 -p /dev/ttyACM0 -b 460800 write_flash \
+  0x0 watch_ai-esp32s3-merged.bin
+```
+
 如果端口不是 `/dev/ttyACM0`，先运行：
 
 ```bash
