@@ -23,6 +23,14 @@ API Key: sk-...
 Model: 由中转站支持的模型名
 ```
 
+如果直接使用豆包/火山方舟文本聊天，可以在配置页填写：
+
+```text
+API URL: https://ark.cn-beijing.volces.com/api/v3
+API Key: 火山方舟 API Key
+Model: 方舟控制台里启用的豆包模型或 endpoint id
+```
+
 语音链路可以直接走中转站，也可以用 `tools/voice_gateway.py` 或 Docker 语音网关做 ASR/TTS/联网资料整理。
 
 ## 配置热点

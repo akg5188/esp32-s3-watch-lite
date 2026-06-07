@@ -3061,17 +3061,30 @@ static void build_api_endpoint_url(const char *endpoint_path, char *out, size_t 
         return;
     }
 
-    const char *v1 = strstr(base, "/v1/");
-    if (v1) {
-        size_t prefix_len = (size_t)(v1 - base);
-        snprintf(out, out_size, "%.*s/v1/%s", (int)prefix_len, base, endpoint_path);
-        return;
+    static const char *const api_base_paths[] = {
+        "/v1",
+        "/api/v3",
+    };
+    for (size_t i = 0; i < sizeof(api_base_paths) / sizeof(api_base_paths[0]); ++i) {
+        const char *api_base_path = api_base_paths[i];
+        const size_t api_base_path_len = strlen(api_base_path);
+        char api_base_path_with_slash[16] = {0};
+        snprintf(api_base_path_with_slash, sizeof(api_base_path_with_slash), "%s/", api_base_path);
+
+        const char *path = strstr(base, api_base_path_with_slash);
+        if (path) {
+            size_t prefix_len = (size_t)(path - base) + api_base_path_len;
+            snprintf(out, out_size, "%.*s/%s", (int)prefix_len, base, endpoint_path);
+            return;
+        }
+        if (len >= api_base_path_len &&
+            strcmp(base + len - api_base_path_len, api_base_path) == 0) {
+            snprintf(out, out_size, "%s/%s", base, endpoint_path);
+            return;
+        }
     }
-    if (len >= strlen("/v1") && strcmp(base + len - strlen("/v1"), "/v1") == 0) {
-        snprintf(out, out_size, "%s/%s", base, endpoint_path);
-    } else {
-        snprintf(out, out_size, "%s/v1/%s", base, endpoint_path);
-    }
+
+    snprintf(out, out_size, "%s/v1/%s", base, endpoint_path);
 }
 
 static void binary_buffer_free(binary_buffer_t *buffer)
@@ -6043,7 +6056,7 @@ static esp_err_t index_get_handler(httpd_req_t *req)
 
     err = httpd_sendf_chunk(req,
         "<h3>AI</h3>"
-        "<label>API URL</label><input name='api_url' maxlength='159' value=\"%s\" placeholder='https://example.com/v1'>"
+        "<label>API URL</label><input name='api_url' maxlength='159' value=\"%s\" placeholder='https://example.com/v1 or https://ark.cn-beijing.volces.com/api/v3'>"
         "<label>API Key</label><input name='api_key' maxlength='191' type='password' placeholder='blank = keep old key'>"
         "<label>Model</label><input name='model' maxlength='63' value=\"%s\">"
         "<label>AI Prompt</label><textarea name='starter_prompt' maxlength='159'>%s</textarea>"

@@ -5,7 +5,7 @@
 ## 当前状态
 
 - 首页显示 `BTC / ETH / XAU / WTI / DXY / CNY / EUR / VIX / SHC / HSI / N225 / DAX / UKX / SPX / NDX`，支持联网刷新和本地缓存。
-- AI 页面支持中文显示、语音输入、TTS 播放、OpenAI 兼容 API URL / API Key / 模型配置。
+- AI 页面支持中文显示、语音输入、TTS 播放、OpenAI 兼容 API URL / API Key / 模型配置；文本聊天可直接配置豆包/火山方舟等兼容接口。
 - 支持最多 5 个 Wi-Fi 配置，每个 Wi-Fi 可保存独立静态 IP、网关、DNS。
 - 配置热点平时关闭省电；短按 BOOT 唤醒并刷新，长按 BOOT 约 2 秒打开配置热点。
 - 蓝牙关闭，Wi-Fi AP 不常驻，功放默认关闭，摇晃唤醒 IMU 默认不启动。
