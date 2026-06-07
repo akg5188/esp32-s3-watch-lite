@@ -585,6 +585,7 @@ static esp_err_t pmic_update_bits(uint8_t reg, uint8_t mask, uint8_t value);
 static esp_err_t pmic_read_battery(void);
 static void battery_update_once(void);
 static void pmic_audio_power_set(bool enabled);
+static void enter_deep_sleep_now(void);
 static esp_err_t imu_write_reg(uint8_t reg, uint8_t value);
 static void log_wakeup_reason(void);
 static void update_ai_dialog_text(void);
@@ -1912,7 +1913,8 @@ static void enter_poweroff_now(void)
     }
 
     vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGW(TAG, "poweroff: PMIC did not cut power, staying in standby");
+    ESP_LOGW(TAG, "poweroff: PMIC did not cut power, entering deep sleep fallback");
+    enter_deep_sleep_now();
 }
 
 static void wifi_shutdown_for_deep_sleep(void)
