@@ -87,6 +87,7 @@ static bool s_ai_text_filter_enabled;
 #define BUTTON_LIGHT_SLEEP_ENABLED 0
 #define AUTO_POWEROFF_ON_SLEEP 1
 #define DEEP_SLEEP_AFTER_SCREEN_OFF_S 15
+#define AI_SCREEN_MIN_AUTO_SLEEP_S 180
 #define DEEP_SLEEP_BOOT_BUTTON_GPIO GPIO_NUM_0
 #define DEEP_SLEEP_POWER_BUTTON_GPIO GPIO_NUM_10
 #define BOOT_LONG_PRESS_CONFIG_AP_MS 2000
@@ -2591,10 +2592,14 @@ static void ui_timer_cb(lv_timer_t *timer)
         home_market_refresh_async();
     }
 
-    if (!g_app.screen_sleeping && g_app.cfg.auto_sleep_s > 0 &&
-        !app_busy_for_sleep()) {
+    int auto_sleep_s = g_app.cfg.auto_sleep_s;
+    if (auto_sleep_s > 0 && g_app.ai_screen && lv_screen_active() == g_app.ai_screen &&
+        auto_sleep_s < AI_SCREEN_MIN_AUTO_SLEEP_S) {
+        auto_sleep_s = AI_SCREEN_MIN_AUTO_SLEEP_S;
+    }
+    if (!g_app.screen_sleeping && auto_sleep_s > 0 && !app_busy_for_sleep()) {
         int64_t idle_us = now_us - g_app.last_activity_us;
-        if (idle_us >= (int64_t)g_app.cfg.auto_sleep_s * 1000000LL) {
+        if (idle_us >= (int64_t)auto_sleep_s * 1000000LL) {
             set_sleeping(true);
         }
     }
@@ -5806,9 +5811,25 @@ static bool direct_ai_start_request(const char *source)
             return false;
         }
     }
-    g_app.ai_tts_stop_requested = false;
     ESP_LOGI(TAG, "voice: start requested by %s", source ? source : "unknown");
     wake_screen_for_input();
+    if (!api_url_is_local_gateway() && g_app.cfg.api_key[0] == '\0') {
+        const ai_profile_t *profile = ai_profile_active();
+        ESP_LOGW(TAG, "voice: missing API key for profile %s", profile->name);
+        copy_string(g_app.ai_state, sizeof(g_app.ai_state), "NO KEY");
+        copy_ai_text(g_app.ai_reply, sizeof(g_app.ai_reply),
+                     "这个 AI 档还没配置 API Key。\n请到配置页给当前模型填 key，或先用已经配置好的自定/GPT。");
+        if (source && strcmp(source, "ui") == 0) {
+            ui_refresh_locked();
+        } else if (bsp_display_lock(1000)) {
+            ui_show_ai();
+            bsp_display_unlock();
+        } else {
+            ui_refresh_now();
+        }
+        return false;
+    }
+    g_app.ai_tts_stop_requested = false;
     g_app.ai_start_inflight = true;
     uint32_t generation = ++g_app.ai_task_generation;
     if (generation == 0) {
