@@ -2258,13 +2258,17 @@ static void ui_create_home(void)
                             (void *)(uintptr_t)i);
     }
 
-    make_button(scr, "GPT", 8, 58, 60, 34, 0x2255A4, home_action_cb, (void *)100);
-    make_button(scr, "Gem", 8, 104, 60, 34, 0x167C7B, home_action_cb, (void *)101);
-    make_button(scr, "豆包", 8, 150, 60, 34, 0x8A4E1D, home_action_cb, (void *)102);
-    make_button(scr, "DS", 344, 58, 58, 34, 0x1B5D78, home_action_cb, (void *)103);
-    make_button(scr, "千问", 344, 104, 58, 34, 0x5C4FA3, home_action_cb, (void *)104);
-    make_button(scr, "自定", 344, 150, 58, 34, 0x31523E, home_action_cb, (void *)105);
-    g_app.ai_profile_label = make_label_font(scr, "自定", 346, 198, 58, 0x91A3BF, AI_DIALOG_FONT);
+    const int btn_y_top = 72;
+    const int btn_y_mid = 238;
+    const int btn_y_bottom = 404;
+    const int side_btn_h = 42;
+    make_button(scr, "GPT", 8, btn_y_top, 62, side_btn_h, 0x2255A4, home_action_cb, (void *)100);
+    make_button(scr, "Gem", 8, btn_y_mid, 62, side_btn_h, 0x167C7B, home_action_cb, (void *)101);
+    make_button(scr, "豆包", 8, btn_y_bottom, 62, side_btn_h, 0x8A4E1D, home_action_cb, (void *)102);
+    make_button(scr, "DS", 340, btn_y_top, 62, side_btn_h, 0x1B5D78, home_action_cb, (void *)103);
+    make_button(scr, "千问", 340, btn_y_mid, 62, side_btn_h, 0x5C4FA3, home_action_cb, (void *)104);
+    make_button(scr, "自定", 340, btn_y_bottom, 62, side_btn_h, 0x31523E, home_action_cb, (void *)105);
+    g_app.ai_profile_label = NULL;
     g_app.home_screen = scr;
 }
 
