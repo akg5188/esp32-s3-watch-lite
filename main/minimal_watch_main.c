@@ -141,6 +141,9 @@ static bool s_ai_text_filter_enabled;
 #define VOICE_TRY_COMBINED_GATEWAY 1
 #define SETUP_PAGE_MAX 24000
 #define COINGECKO_MARKET_URL "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"
+#define GATE_TICKER_URL_FMT "https://api.gateio.ws/api/v4/spot/tickers?currency_pair=%s_USDT"
+#define HUOBI_TICKER_URL_FMT "https://api.huobi.pro/market/detail/merged?symbol=%susdt"
+#define BINANCE_TICKER_URL_FMT "https://api.binance.com/api/v3/ticker/24hr?symbol=%sUSDT"
 #define STOOQ_QUOTE_URL_FMT "https://stooq.com/q/l/?s=%s&f=sd2t2ohlcv&h&e=csv"
 #define YAHOO_CHART_URL_FMT "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=30m"
 #define YAHOO_HOME_URL_FMT "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=1d"
@@ -3731,8 +3734,9 @@ static void http_client_destroy_proxy_transport(esp_transport_handle_t proxy_tra
 #endif
 }
 
-static esp_err_t direct_http_request(const char *url, const char *payload, int timeout_ms,
-                                     bool use_auth, char *body, size_t body_size)
+static esp_err_t direct_http_request_impl(const char *url, const char *payload, int timeout_ms,
+                                          bool use_auth, char *body, size_t body_size,
+                                          bool allow_proxy)
 {
     if (!g_app.sta_connected) {
         return ESP_ERR_INVALID_STATE;
@@ -3762,7 +3766,7 @@ static esp_err_t direct_http_request(const char *url, const char *payload, int t
     config.crt_bundle_attach = esp_crt_bundle_attach;
 #endif
 
-    esp_transport_handle_t proxy_transport = http_client_attach_proxy(&config, url);
+    esp_transport_handle_t proxy_transport = allow_proxy ? http_client_attach_proxy(&config, url) : NULL;
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         http_client_destroy_proxy_transport(proxy_transport);
@@ -3800,6 +3804,18 @@ static esp_err_t direct_http_request(const char *url, const char *payload, int t
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+static esp_err_t direct_http_request(const char *url, const char *payload, int timeout_ms,
+                                     bool use_auth, char *body, size_t body_size)
+{
+    return direct_http_request_impl(url, payload, timeout_ms, use_auth, body, body_size, true);
+}
+
+static esp_err_t direct_http_request_no_proxy(const char *url, const char *payload, int timeout_ms,
+                                              bool use_auth, char *body, size_t body_size)
+{
+    return direct_http_request_impl(url, payload, timeout_ms, use_auth, body, body_size, false);
 }
 
 static void build_api_endpoint_url(const char *endpoint_path, char *out, size_t out_size)
@@ -5338,14 +5354,69 @@ static bool parse_yahoo_chart(const char *body, int row_index, bool update_chart
     return true;
 }
 
-static bool parse_coingecko_home_market(const char *body)
+static bool json_item_to_double(cJSON *item, double *out)
+{
+    if (!out) {
+        return false;
+    }
+    if (cJSON_IsNumber(item)) {
+        *out = item->valuedouble;
+        return true;
+    }
+    if (cJSON_IsString(item) && item->valuestring && item->valuestring[0]) {
+        char *end = NULL;
+        double value = strtod(item->valuestring, &end);
+        if (end && end != item->valuestring) {
+            *out = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool update_crypto_market_row(int row_index, double price, double change_pct)
+{
+    if (row_index < 0 || row_index >= MARKET_ROW_COUNT || price <= 0.0) {
+        return false;
+    }
+    char price_text[24] = {0};
+    char change_text[16] = {0};
+    format_price(MARKET_DEFS[row_index].code, price, price_text, sizeof(price_text));
+    format_change(change_pct, change_text, sizeof(change_text));
+    copy_string(g_app.market_rows[row_index].price,
+                sizeof(g_app.market_rows[row_index].price), price_text);
+    copy_string(g_app.market_rows[row_index].change,
+                sizeof(g_app.market_rows[row_index].change), change_text);
+    return true;
+}
+
+static esp_err_t market_http_request_auto(const char *url, char *body, size_t body_size)
+{
+    memset(body, 0, body_size);
+    esp_err_t err = direct_http_request_no_proxy(url, NULL, DIRECT_HTTP_TIMEOUT_MS,
+                                                false, body, body_size);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    if (g_app.cfg.proxy_host[0] == '\0' || g_app.cfg.proxy_port <= 0) {
+        return err;
+    }
+
+    ESP_LOGW(TAG, "market direct failed err=%s, trying proxy url=%s",
+             esp_err_to_name(err), url);
+    memset(body, 0, body_size);
+    return direct_http_request(url, NULL, DIRECT_HTTP_TIMEOUT_MS, false, body, body_size);
+}
+
+static int parse_coingecko_home_market(const char *body)
 {
     if (!body || !body[0]) {
-        return false;
+        return 0;
     }
     cJSON *root = cJSON_Parse(body);
     if (!root) {
-        return false;
+        return 0;
     }
 
     struct {
@@ -5381,19 +5452,147 @@ static bool parse_coingecko_home_market(const char *body)
     }
 
     cJSON_Delete(root);
-    return ok_count > 0;
+    return ok_count;
+}
+
+static bool parse_gate_crypto_ticker(const char *body, int row_index)
+{
+    if (!body || !body[0]) {
+        return false;
+    }
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return false;
+    }
+    cJSON *item = cJSON_IsArray(root) ? cJSON_GetArrayItem(root, 0) : NULL;
+    cJSON *last = cJSON_IsObject(item) ? cJSON_GetObjectItemCaseSensitive(item, "last") : NULL;
+    cJSON *change = cJSON_IsObject(item) ? cJSON_GetObjectItemCaseSensitive(item, "change_percentage") : NULL;
+    double price = 0.0;
+    double change_pct = 0.0;
+    bool ok = json_item_to_double(last, &price) &&
+              json_item_to_double(change, &change_pct) &&
+              update_crypto_market_row(row_index, price, change_pct);
+    cJSON_Delete(root);
+    return ok;
+}
+
+static bool parse_huobi_crypto_ticker(const char *body, int row_index)
+{
+    if (!body || !body[0]) {
+        return false;
+    }
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return false;
+    }
+    cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
+    cJSON *tick = cJSON_GetObjectItemCaseSensitive(root, "tick");
+    cJSON *close_item = cJSON_IsObject(tick) ? cJSON_GetObjectItemCaseSensitive(tick, "close") : NULL;
+    cJSON *open_item = cJSON_IsObject(tick) ? cJSON_GetObjectItemCaseSensitive(tick, "open") : NULL;
+    double price = 0.0;
+    double open = 0.0;
+    bool status_ok = !cJSON_IsString(status) || strcmp(status->valuestring, "ok") == 0;
+    bool ok = status_ok &&
+              json_item_to_double(close_item, &price) &&
+              json_item_to_double(open_item, &open) &&
+              open > 0.0 &&
+              update_crypto_market_row(row_index, price, ((price - open) / open) * 100.0);
+    cJSON_Delete(root);
+    return ok;
+}
+
+static bool parse_binance_crypto_ticker(const char *body, int row_index)
+{
+    if (!body || !body[0]) {
+        return false;
+    }
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return false;
+    }
+    cJSON *last = cJSON_GetObjectItemCaseSensitive(root, "lastPrice");
+    cJSON *change = cJSON_GetObjectItemCaseSensitive(root, "priceChangePercent");
+    double price = 0.0;
+    double change_pct = 0.0;
+    bool ok = json_item_to_double(last, &price) &&
+              json_item_to_double(change, &change_pct) &&
+              update_crypto_market_row(row_index, price, change_pct);
+    cJSON_Delete(root);
+    return ok;
+}
+
+static bool refresh_crypto_row_from_regional_sources(int row_index, const char *base_symbol,
+                                                     char *body, size_t body_size)
+{
+    char url[192] = {0};
+
+    snprintf(url, sizeof(url), GATE_TICKER_URL_FMT, base_symbol);
+    if (market_http_request_auto(url, body, body_size) == ESP_OK &&
+        parse_gate_crypto_ticker(body, row_index)) {
+        return true;
+    }
+
+    snprintf(url, sizeof(url), HUOBI_TICKER_URL_FMT, base_symbol);
+    for (char *p = strstr(url, "symbol="); p && *p; ++p) {
+        *p = (char)tolower((unsigned char)*p);
+    }
+    if (market_http_request_auto(url, body, body_size) == ESP_OK &&
+        parse_huobi_crypto_ticker(body, row_index)) {
+        return true;
+    }
+
+    snprintf(url, sizeof(url), BINANCE_TICKER_URL_FMT, base_symbol);
+    if (market_http_request_auto(url, body, body_size) == ESP_OK &&
+        parse_binance_crypto_ticker(body, row_index)) {
+        return true;
+    }
+
+    return false;
+}
+
+static int refresh_crypto_from_regional_sources(char *body, size_t body_size)
+{
+    struct {
+        int row_index;
+        const char *base_symbol;
+    } coins[] = {
+        {0, "BTC"},
+        {1, "ETH"},
+    };
+
+    int ok_count = 0;
+    for (size_t i = 0; i < sizeof(coins) / sizeof(coins[0]); i++) {
+        if (refresh_crypto_row_from_regional_sources(coins[i].row_index,
+                                                     coins[i].base_symbol,
+                                                     body, body_size)) {
+            ok_count++;
+        }
+    }
+    if (ok_count > 0) {
+        mark_market_time_now();
+    }
+    return ok_count;
 }
 
 static int refresh_crypto_from_coingecko(char *body, size_t body_size)
 {
-    memset(body, 0, body_size);
-    esp_err_t err = direct_http_request(COINGECKO_MARKET_URL, NULL, DIRECT_HTTP_TIMEOUT_MS,
-                                        false, body, body_size);
-    if (err != ESP_OK || !parse_coingecko_home_market(body)) {
+    esp_err_t err = market_http_request_auto(COINGECKO_MARKET_URL, body, body_size);
+    int ok_count = err == ESP_OK ? parse_coingecko_home_market(body) : 0;
+    if (ok_count <= 0) {
         return 0;
     }
     mark_market_time_now();
-    return 2;
+    return ok_count;
+}
+
+static int refresh_crypto_home_market(char *body, size_t body_size)
+{
+    int ok_count = refresh_crypto_from_regional_sources(body, body_size);
+    if (ok_count >= 2) {
+        return ok_count;
+    }
+    int fallback_count = refresh_crypto_from_coingecko(body, body_size);
+    return fallback_count > ok_count ? fallback_count : ok_count;
 }
 
 static bool parse_gateway_market_full(const char *body)
@@ -5504,9 +5703,9 @@ static void home_market_refresh_task(void *arg)
         return;
     }
 
-    int ok_count = refresh_crypto_from_coingecko(body, DIRECT_HTTP_MAX_BODY + 1);
+    int ok_count = refresh_crypto_home_market(body, DIRECT_HTTP_MAX_BODY + 1);
     if (ok_count > 0) {
-        snprintf(g_app.market_status, sizeof(g_app.market_status), "CG %d", ok_count);
+        snprintf(g_app.market_status, sizeof(g_app.market_status), "CN %d", ok_count);
         ui_refresh_now();
     }
 
@@ -5528,8 +5727,7 @@ static void home_market_refresh_task(void *arg)
         snprintf(url, sizeof(url), YAHOO_HOME_URL_FMT, MARKET_DEFS[i].chart_symbol);
         memset(body, 0, DIRECT_HTTP_MAX_BODY + 1);
         yahoo_tries++;
-        esp_err_t err = direct_http_request(url, NULL, DIRECT_HTTP_TIMEOUT_MS,
-                                            false, body, DIRECT_HTTP_MAX_BODY + 1);
+        esp_err_t err = market_http_request_auto(url, body, DIRECT_HTTP_MAX_BODY + 1);
         if (err == ESP_OK && parse_yahoo_chart(body, i, false)) {
             ok_count++;
             snprintf(g_app.market_status, sizeof(g_app.market_status), "%d/%d", ok_count, MARKET_ROW_COUNT);
@@ -6484,8 +6682,7 @@ static void chart_refresh_task(void *arg)
     copy_string(g_app.chart_hint, sizeof(g_app.chart_hint), "Loading");
     ui_refresh_now();
 
-    esp_err_t err = direct_http_request(url, NULL, DIRECT_HTTP_TIMEOUT_MS,
-                                        false, body, DIRECT_HTTP_MAX_BODY + 1);
+    esp_err_t err = market_http_request_auto(url, body, DIRECT_HTTP_MAX_BODY + 1);
     bool parsed = err == ESP_OK && parse_yahoo_chart(body, row_index, true);
     if (parsed) {
         mark_market_time_now();
@@ -6888,9 +7085,10 @@ static esp_err_t index_get_handler(httpd_req_t *req)
     err = httpd_sendf_chunk(req,
         "<label>AI Prompt</label><textarea name='starter_prompt' maxlength='159'>%s</textarea>"
         "<label>Market</label><select name='market_provider'>"
-        "<option value='coingecko' %s>coingecko</option><option value='mock' %s>mock</option></select>"
+        "<option value='coingecko' %s>auto-cn</option><option value='mock' %s>mock</option></select>"
         "<h3>Common</h3>"
         "<p class='muted'>每个 WiFi 的 Static IP/Gateway/DNS 在对应 WiFi 卡片里单独保存；留空就是 DHCP。</p>"
+        "<p class='muted'>行情默认直连优先，BTC/ETH 先用 Gate/Huobi/Binance；直连失败且配置了 Clash 时才尝试代理。</p>"
         "<p class='muted'>Clash/Meta 局域网共享请填代理 IP 和 mixed/http 端口；公网请求会走 HTTP CONNECT，局域网地址不走代理。</p>"
         "<label>Clash Proxy Host</label><input name='proxy_host' maxlength='63' value=\"%s\" placeholder='192.168.43.1'>"
         "<label>Clash Proxy Port</label><input name='proxy_port' type='number' min='0' max='65535' value='%d' placeholder='7890'>"
