@@ -57,6 +57,15 @@ Model: 方舟控制台里启用的豆包模型或 endpoint id
 
 点选不同 Wi-Fi 后，手表会按该 Wi-Fi 对应的网络参数连接。
 
+## Clash 代理
+
+如果在外面只能使用 Clash Meta 的局域网共享，不要把 Clash 设备填成 Gateway 或 DNS。Wi-Fi 的 Static IP/Gateway/DNS 保持留空走 DHCP，然后在设置页填写：
+
+- `Clash Proxy Host`：运行 Clash 的手机或电脑局域网 IP，例如热点网关 IP。
+- `Clash Proxy Port`：Clash 的 `mixed-port` 或 `http-port`，常见是 `7890`。
+
+固件会让公网 HTTP/HTTPS 请求走 HTTP CONNECT 代理；`192.168.x.x`、`10.x.x.x`、`172.16-31.x.x` 等局域网地址仍直连。
+
 ## 省电行为
 
 - 蓝牙关闭。

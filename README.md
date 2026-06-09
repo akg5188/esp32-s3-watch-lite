@@ -7,6 +7,7 @@
 - 首页显示 `BTC / ETH / XAU / WTI / DXY / CNY / EUR / VIX / SHC / HSI / N225 / DAX / UKX / SPX / NDX`，支持联网刷新和本地缓存。
 - AI 页面支持中文显示、语音输入、TTS 播放、多 AI Profile 切换；文本聊天可直接配置 GPT、Gemini、豆包、DeepSeek、千问等兼容接口。
 - 支持最多 5 个 Wi-Fi 配置，每个 Wi-Fi 可保存独立静态 IP、网关、DNS。
+- 支持 Clash/Meta 局域网共享代理：配置 `Proxy Host` 和 `Proxy Port` 后，公网 HTTP/HTTPS 请求会通过 HTTP CONNECT 代理，局域网地址仍直连。
 - 配置热点平时关闭省电；短按 BOOT 唤醒并刷新，长按 BOOT 约 2 秒打开配置热点。
 - 蓝牙关闭，Wi-Fi AP 不常驻，功放默认关闭，摇晃唤醒 IMU 默认不启动。
 - 息屏后约 15 秒进入 deep sleep，只保留 BOOT 按键唤醒。
@@ -70,7 +71,7 @@ Wi-Fi: WatchLite-xxxx
 网页: http://192.168.4.1
 ```
 
-网页里可以配置 Wi-Fi、静态 IP、API URL、API Key、模型、行情、亮度、睡眠等。
+网页里可以配置 Wi-Fi、静态 IP、Clash 代理、API URL、API Key、模型、行情、亮度、睡眠等。
 
 ## 安全说明
 

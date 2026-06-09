@@ -8,6 +8,7 @@ idf_component_register(
         esp_driver_i2c
         esp_http_server
         esp_http_client
+        esp-tls
         esp_codec_dev
         esp_driver_i2s
         esp_netif
@@ -17,4 +18,5 @@ idf_component_register(
         json
         mbedtls
         nvs_flash
+        tcp_transport
 )

@@ -1,14 +1,20 @@
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/select.h>
 #include <sys/param.h>
+#include <sys/socket.h>
 #include <strings.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "sdkconfig.h"
 #include "bsp/esp32_s3_touch_amoled_2_06.h"
@@ -30,6 +36,8 @@
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_tls.h"
+#include "esp_transport.h"
 #include "esp_wifi.h"
 #if CONFIG_BT_ENABLED
 #include "esp_bt.h"
@@ -388,6 +396,14 @@ typedef struct {
     bool refresh_market;
 } voice_gateway_result_t;
 
+typedef struct {
+    char proxy_host[64];
+    int proxy_port;
+    bool use_tls;
+    int sockfd;
+    esp_tls_t *tls;
+} http_proxy_transport_ctx_t;
+
 typedef enum {
     MARKET_SOURCE_CRYPTO = 0,
     MARKET_SOURCE_STOOQ,
@@ -606,6 +622,9 @@ static esp_err_t perform_gateway_voice_request(const uint8_t *wav_data, size_t w
 static esp_err_t fetch_gateway_audio(const char *audio_url, binary_buffer_t *audio_out,
                                      char *error_out, size_t error_out_len);
 static void binary_buffer_free(binary_buffer_t *buffer);
+static esp_transport_handle_t http_client_attach_proxy(esp_http_client_config_t *config,
+                                                       const char *url);
+static void http_client_destroy_proxy_transport(esp_transport_handle_t proxy_transport);
 
 static const market_asset_def_t MARKET_DEFS[MARKET_ROW_COUNT] = {
     {"BTC", "bitcoin", "BTC-USD", MARKET_SOURCE_CRYPTO, 0xF7C873},
@@ -3191,6 +3210,527 @@ static void log_http_failure(const char *url, esp_err_t err, int status,
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 }
 
+static bool proxy_parse_url_target(const char *url, char *scheme, size_t scheme_size,
+                                   char *host, size_t host_size, int *port)
+{
+    if (!url || !scheme || scheme_size == 0 || !host || host_size == 0 || !port) {
+        return false;
+    }
+    scheme[0] = '\0';
+    host[0] = '\0';
+    *port = 0;
+
+    const char *scheme_end = strstr(url, "://");
+    if (!scheme_end || scheme_end == url) {
+        return false;
+    }
+    size_t scheme_len = (size_t)(scheme_end - url);
+    if (scheme_len >= scheme_size) {
+        return false;
+    }
+    memcpy(scheme, url, scheme_len);
+    scheme[scheme_len] = '\0';
+
+    const char *p = scheme_end + 3;
+    const char *host_start = p;
+    const char *host_end = p;
+    if (*host_start == '[') {
+        host_start++;
+        host_end = strchr(host_start, ']');
+        if (!host_end) {
+            return false;
+        }
+        p = host_end + 1;
+    } else {
+        while (*host_end && *host_end != '/' && *host_end != '?' && *host_end != '#' &&
+               *host_end != ':') {
+            host_end++;
+        }
+        p = host_end;
+    }
+    size_t host_len = (size_t)(host_end - host_start);
+    if (host_len == 0 || host_len >= host_size) {
+        return false;
+    }
+    memcpy(host, host_start, host_len);
+    host[host_len] = '\0';
+
+    if (*p == ':') {
+        p++;
+        int parsed_port = 0;
+        while (isdigit((unsigned char)*p)) {
+            parsed_port = parsed_port * 10 + (*p - '0');
+            p++;
+        }
+        if (parsed_port <= 0 || parsed_port > 65535) {
+            return false;
+        }
+        *port = parsed_port;
+    } else if (strcasecmp(scheme, "https") == 0) {
+        *port = 443;
+    } else if (strcasecmp(scheme, "http") == 0) {
+        *port = 80;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static bool proxy_host_is_private_or_local(const char *host)
+{
+    if (!host || host[0] == '\0') {
+        return true;
+    }
+    if (strcasecmp(host, "localhost") == 0 ||
+        strcmp(host, "127.0.0.1") == 0 ||
+        strcmp(host, "::1") == 0) {
+        return true;
+    }
+    int a = 0, b = 0, c = 0, d = 0;
+    char tail = '\0';
+    if (sscanf(host, "%d.%d.%d.%d%c", &a, &b, &c, &d, &tail) == 4 &&
+        a >= 0 && a <= 255 && b >= 0 && b <= 255 &&
+        c >= 0 && c <= 255 && d >= 0 && d <= 255) {
+        if (a == 10 || a == 127 || a == 0 || a == 169) {
+            return true;
+        }
+        if (a == 192 && b == 168) {
+            return true;
+        }
+        if (a == 172 && b >= 16 && b <= 31) {
+            return true;
+        }
+    }
+    size_t len = strlen(host);
+    return len >= 6 && strcasecmp(host + len - 6, ".local") == 0;
+}
+
+static bool proxy_should_use_for_url(const char *url, bool *use_tls_out)
+{
+    if (use_tls_out) {
+        *use_tls_out = false;
+    }
+    if (g_app.cfg.proxy_host[0] == '\0' || g_app.cfg.proxy_port <= 0) {
+        return false;
+    }
+
+    char scheme[8] = {0};
+    char host[128] = {0};
+    int port = 0;
+    if (!proxy_parse_url_target(url, scheme, sizeof(scheme), host, sizeof(host), &port)) {
+        return false;
+    }
+    if (proxy_host_is_private_or_local(host)) {
+        return false;
+    }
+    if (strcasecmp(scheme, "https") == 0) {
+        if (use_tls_out) {
+            *use_tls_out = true;
+        }
+        return true;
+    }
+    if (strcasecmp(scheme, "http") == 0) {
+        return true;
+    }
+    return false;
+}
+
+static void proxy_set_socket_timeout(int sockfd, int timeout_ms)
+{
+    if (sockfd < 0) {
+        return;
+    }
+    struct timeval tv = {
+        .tv_sec = timeout_ms > 0 ? timeout_ms / 1000 : 10,
+        .tv_usec = timeout_ms > 0 ? (timeout_ms % 1000) * 1000 : 0,
+    };
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static int proxy_tcp_connect(const char *host, int port, int timeout_ms)
+{
+    if (!host || host[0] == '\0' || port <= 0 || port > 65535) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char port_text[8] = {0};
+    snprintf(port_text, sizeof(port_text), "%d", port);
+    struct addrinfo hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
+    };
+    struct addrinfo *result = NULL;
+    int gai = getaddrinfo(host, port_text, &hints, &result);
+    if (gai != 0 || !result) {
+        ESP_LOGW(TAG, "proxy: resolve failed host=%s gai=%d", host, gai);
+        errno = ENOENT;
+        return -1;
+    }
+
+    int connect_timeout = timeout_ms > 0 ? timeout_ms : 10000;
+    int sockfd = -1;
+    for (struct addrinfo *ai = result; ai; ai = ai->ai_next) {
+        sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (sockfd < 0) {
+            continue;
+        }
+
+        int flags = fcntl(sockfd, F_GETFL, 0);
+        if (flags >= 0) {
+            (void)fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+        }
+        int rc = connect(sockfd, ai->ai_addr, ai->ai_addrlen);
+        if (rc < 0 && errno == EINPROGRESS) {
+            fd_set write_set;
+            FD_ZERO(&write_set);
+            FD_SET(sockfd, &write_set);
+            struct timeval tv = {
+                .tv_sec = connect_timeout / 1000,
+                .tv_usec = (connect_timeout % 1000) * 1000,
+            };
+            rc = select(sockfd + 1, NULL, &write_set, NULL, &tv);
+            if (rc > 0) {
+                int sock_error = 0;
+                socklen_t sock_error_len = sizeof(sock_error);
+                if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR,
+                               &sock_error, &sock_error_len) == 0) {
+                    if (sock_error == 0) {
+                        rc = 0;
+                    } else {
+                        errno = sock_error;
+                        rc = -1;
+                    }
+                } else {
+                    rc = -1;
+                }
+            } else {
+                errno = (rc == 0) ? ETIMEDOUT : errno;
+                rc = -1;
+            }
+        }
+        if (flags >= 0) {
+            (void)fcntl(sockfd, F_SETFL, flags);
+        }
+        if (rc == 0) {
+            proxy_set_socket_timeout(sockfd, timeout_ms);
+            break;
+        }
+        close(sockfd);
+        sockfd = -1;
+    }
+    freeaddrinfo(result);
+    return sockfd;
+}
+
+static int proxy_socket_write_all(int sockfd, const char *data, size_t len)
+{
+    size_t written = 0;
+    while (written < len) {
+        ssize_t rc = send(sockfd, data + written, len - written, 0);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (rc == 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+        written += (size_t)rc;
+    }
+    return 0;
+}
+
+static int proxy_wait_for_headers(int sockfd, char *response, size_t response_size)
+{
+    if (!response || response_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t len = 0;
+    response[0] = '\0';
+    while (len + 1 < response_size) {
+        ssize_t rc = recv(sockfd, response + len, 1, 0);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (rc == 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+        len += (size_t)rc;
+        response[len] = '\0';
+        if (len >= 4 && strstr(response, "\r\n\r\n")) {
+            return (int)len;
+        }
+    }
+    errno = EMSGSIZE;
+    return -1;
+}
+
+static int proxy_transport_connect(esp_transport_handle_t transport,
+                                   const char *host, int port, int timeout_ms)
+{
+    http_proxy_transport_ctx_t *ctx = esp_transport_get_context_data(transport);
+    if (!ctx || !host || host[0] == '\0' || port <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    ctx->sockfd = proxy_tcp_connect(ctx->proxy_host, ctx->proxy_port, timeout_ms);
+    if (ctx->sockfd < 0) {
+        ESP_LOGW(TAG, "proxy: connect failed proxy=%s:%d errno=%d",
+                 ctx->proxy_host, ctx->proxy_port, errno);
+        return -1;
+    }
+
+    char connect_req[256] = {0};
+    snprintf(connect_req, sizeof(connect_req),
+             "CONNECT %s:%d HTTP/1.1\r\n"
+             "Host: %s:%d\r\n"
+             "Proxy-Connection: close\r\n"
+             "User-Agent: WatchLite/1\r\n\r\n",
+             host, port, host, port);
+    if (proxy_socket_write_all(ctx->sockfd, connect_req, strlen(connect_req)) != 0) {
+        ESP_LOGW(TAG, "proxy: CONNECT write failed errno=%d", errno);
+        close(ctx->sockfd);
+        ctx->sockfd = -1;
+        return -1;
+    }
+
+    char response[384] = {0};
+    if (proxy_wait_for_headers(ctx->sockfd, response, sizeof(response)) < 0) {
+        ESP_LOGW(TAG, "proxy: CONNECT response failed errno=%d", errno);
+        close(ctx->sockfd);
+        ctx->sockfd = -1;
+        return -1;
+    }
+    if (!strstr(response, " 200 ") && !strstr(response, " 200\r\n")) {
+        ESP_LOGW(TAG, "proxy: CONNECT rejected host=%s:%d response=%.80s",
+                 host, port, response);
+        close(ctx->sockfd);
+        ctx->sockfd = -1;
+        errno = ECONNREFUSED;
+        return -1;
+    }
+
+    if (ctx->use_tls) {
+        esp_tls_t *tls = esp_tls_init();
+        if (!tls) {
+            close(ctx->sockfd);
+            ctx->sockfd = -1;
+            errno = ENOMEM;
+            return -1;
+        }
+        esp_tls_cfg_t tls_cfg = {
+            .timeout_ms = timeout_ms,
+            .addr_family = ESP_TLS_AF_INET,
+        };
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+        tls_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
+        (void)esp_tls_set_conn_sockfd(tls, ctx->sockfd);
+        (void)esp_tls_set_conn_state(tls, ESP_TLS_CONNECTING);
+        int tls_ret = esp_tls_conn_new_sync(host, (int)strlen(host), port, &tls_cfg, tls);
+        if (tls_ret != 1) {
+            ESP_LOGW(TAG, "proxy: TLS handshake failed host=%s:%d ret=%d",
+                     host, port, tls_ret);
+            (void)esp_tls_conn_destroy(tls);
+            ctx->sockfd = -1;
+            errno = ECONNABORTED;
+            return -1;
+        }
+        ctx->tls = tls;
+    }
+
+    ESP_LOGI(TAG, "proxy: connected %s:%d via %s:%d%s",
+             host, port, ctx->proxy_host, ctx->proxy_port,
+             ctx->use_tls ? " tls" : "");
+    return 0;
+}
+
+static int proxy_transport_read(esp_transport_handle_t transport,
+                                char *buffer, int len, int timeout_ms)
+{
+    (void)timeout_ms;
+    http_proxy_transport_ctx_t *ctx = esp_transport_get_context_data(transport);
+    if (!ctx || !buffer || len <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ctx->tls) {
+        ssize_t rc = esp_tls_conn_read(ctx->tls, buffer, (size_t)len);
+        return (int)rc;
+    }
+    if (ctx->sockfd < 0) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    ssize_t rc = recv(ctx->sockfd, buffer, (size_t)len, 0);
+    return (int)rc;
+}
+
+static int proxy_transport_write(esp_transport_handle_t transport,
+                                 const char *buffer, int len, int timeout_ms)
+{
+    (void)timeout_ms;
+    http_proxy_transport_ctx_t *ctx = esp_transport_get_context_data(transport);
+    if (!ctx || !buffer || len <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ctx->tls) {
+        ssize_t rc = esp_tls_conn_write(ctx->tls, buffer, (size_t)len);
+        return (int)rc;
+    }
+    if (ctx->sockfd < 0) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    ssize_t rc = send(ctx->sockfd, buffer, (size_t)len, 0);
+    return (int)rc;
+}
+
+static int proxy_transport_poll_read(esp_transport_handle_t transport, int timeout_ms)
+{
+    http_proxy_transport_ctx_t *ctx = esp_transport_get_context_data(transport);
+    if (!ctx || ctx->sockfd < 0) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(ctx->sockfd, &read_set);
+    struct timeval tv = {
+        .tv_sec = timeout_ms > 0 ? timeout_ms / 1000 : 0,
+        .tv_usec = timeout_ms > 0 ? (timeout_ms % 1000) * 1000 : 0,
+    };
+    return select(ctx->sockfd + 1, &read_set, NULL, NULL,
+                  timeout_ms < 0 ? NULL : &tv);
+}
+
+static int proxy_transport_poll_write(esp_transport_handle_t transport, int timeout_ms)
+{
+    http_proxy_transport_ctx_t *ctx = esp_transport_get_context_data(transport);
+    if (!ctx || ctx->sockfd < 0) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    fd_set write_set;
+    FD_ZERO(&write_set);
+    FD_SET(ctx->sockfd, &write_set);
+    struct timeval tv = {
+        .tv_sec = timeout_ms > 0 ? timeout_ms / 1000 : 0,
+        .tv_usec = timeout_ms > 0 ? (timeout_ms % 1000) * 1000 : 0,
+    };
+    return select(ctx->sockfd + 1, NULL, &write_set, NULL,
+                  timeout_ms < 0 ? NULL : &tv);
+}
+
+static int proxy_transport_close(esp_transport_handle_t transport)
+{
+    http_proxy_transport_ctx_t *ctx = esp_transport_get_context_data(transport);
+    if (!ctx) {
+        return 0;
+    }
+    int ret = 0;
+    if (ctx->tls) {
+        ret = esp_tls_conn_destroy(ctx->tls);
+        ctx->tls = NULL;
+        ctx->sockfd = -1;
+    } else if (ctx->sockfd >= 0) {
+        ret = close(ctx->sockfd);
+        ctx->sockfd = -1;
+    }
+    return ret;
+}
+
+static esp_err_t proxy_transport_destroy(esp_transport_handle_t transport)
+{
+    if (!transport) {
+        return ESP_OK;
+    }
+    http_proxy_transport_ctx_t *ctx = esp_transport_get_context_data(transport);
+    if (ctx) {
+        (void)proxy_transport_close(transport);
+        free(ctx);
+    }
+    return ESP_OK;
+}
+
+static esp_transport_handle_t proxy_transport_create(const char *url)
+{
+#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
+    bool use_tls = false;
+    if (!proxy_should_use_for_url(url, &use_tls)) {
+        return NULL;
+    }
+
+    esp_transport_handle_t transport = esp_transport_init();
+    if (!transport) {
+        return NULL;
+    }
+    http_proxy_transport_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        esp_transport_destroy(transport);
+        return NULL;
+    }
+    copy_string(ctx->proxy_host, sizeof(ctx->proxy_host), g_app.cfg.proxy_host);
+    ctx->proxy_port = g_app.cfg.proxy_port;
+    ctx->use_tls = use_tls;
+    ctx->sockfd = -1;
+    esp_transport_set_context_data(transport, ctx);
+    esp_transport_set_func(transport,
+                           proxy_transport_connect,
+                           proxy_transport_read,
+                           proxy_transport_write,
+                           proxy_transport_close,
+                           proxy_transport_poll_read,
+                           proxy_transport_poll_write,
+                           proxy_transport_destroy);
+    return transport;
+#else
+    (void)url;
+    return NULL;
+#endif
+}
+
+static esp_transport_handle_t http_client_attach_proxy(esp_http_client_config_t *config,
+                                                       const char *url)
+{
+#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
+    if (!config) {
+        return NULL;
+    }
+    esp_transport_handle_t proxy_transport = proxy_transport_create(url);
+    if (proxy_transport) {
+        config->transport = proxy_transport;
+    }
+    return proxy_transport;
+#else
+    (void)config;
+    (void)url;
+    return NULL;
+#endif
+}
+
+static void http_client_destroy_proxy_transport(esp_transport_handle_t proxy_transport)
+{
+#if CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT
+    if (proxy_transport) {
+        esp_transport_destroy(proxy_transport);
+    }
+#else
+    (void)proxy_transport;
+#endif
+}
+
 static esp_err_t direct_http_request(const char *url, const char *payload, int timeout_ms,
                                      bool use_auth, char *body, size_t body_size)
 {
@@ -3222,8 +3762,10 @@ static esp_err_t direct_http_request(const char *url, const char *payload, int t
     config.crt_bundle_attach = esp_crt_bundle_attach;
 #endif
 
+    esp_transport_handle_t proxy_transport = http_client_attach_proxy(&config, url);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
+        http_client_destroy_proxy_transport(proxy_transport);
         return ESP_ERR_NO_MEM;
     }
 
@@ -3247,6 +3789,7 @@ static esp_err_t direct_http_request(const char *url, const char *payload, int t
     int tls_flags = 0;
     (void)esp_http_client_get_and_clear_last_tls_error(client, &tls_err, &tls_flags);
     esp_http_client_cleanup(client);
+    http_client_destroy_proxy_transport(proxy_transport);
 
     if (err != ESP_OK) {
         log_http_failure(url, err, status, sock_errno, tls_err, tls_flags);
@@ -3652,8 +4195,10 @@ static esp_err_t perform_gateway_voice_request(const uint8_t *wav_data, size_t w
     }
 #endif
 
+    esp_transport_handle_t proxy_transport = http_client_attach_proxy(&config, voice_url);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
+        http_client_destroy_proxy_transport(proxy_transport);
         http_body_free(body);
         binary_buffer_free(&request);
         return ESP_ERR_NO_MEM;
@@ -3674,6 +4219,7 @@ static esp_err_t perform_gateway_voice_request(const uint8_t *wav_data, size_t w
     err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    http_client_destroy_proxy_transport(proxy_transport);
     binary_buffer_free(&request);
 
     if (err == ESP_OK && status >= 200 && status < 300) {
@@ -3739,8 +4285,10 @@ static esp_err_t fetch_gateway_audio(const char *audio_url, binary_buffer_t *aud
     }
 #endif
 
+    esp_transport_handle_t proxy_transport = http_client_attach_proxy(&config, url);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
+        http_client_destroy_proxy_transport(proxy_transport);
         return ESP_ERR_NO_MEM;
     }
     if (g_app.cfg.api_key[0]) {
@@ -3752,6 +4300,7 @@ static esp_err_t fetch_gateway_audio(const char *audio_url, binary_buffer_t *aud
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    http_client_destroy_proxy_transport(proxy_transport);
     if (err != ESP_OK) {
         if (error_out && error_out_len) {
             snprintf(error_out, error_out_len, "语音音频下载失败: %s", esp_err_to_name(err));
@@ -4124,8 +4673,10 @@ static esp_err_t perform_stt_request(const uint8_t *wav_data, size_t wav_len,
     }
 #endif
 
+    esp_transport_handle_t proxy_transport = http_client_attach_proxy(&config, stt_url);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
+        http_client_destroy_proxy_transport(proxy_transport);
         http_body_free(body);
         binary_buffer_free(&request);
         return ESP_ERR_NO_MEM;
@@ -4146,6 +4697,7 @@ static esp_err_t perform_stt_request(const uint8_t *wav_data, size_t wav_len,
     err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    http_client_destroy_proxy_transport(proxy_transport);
     binary_buffer_free(&request);
 
     if (err == ESP_OK && status >= 200 && status < 300) {
@@ -4221,8 +4773,10 @@ static esp_err_t perform_tts_request(const char *text, binary_buffer_t *audio_ou
     }
 #endif
 
+    esp_transport_handle_t proxy_transport = http_client_attach_proxy(&config, tts_url);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
+        http_client_destroy_proxy_transport(proxy_transport);
         free(payload);
         return ESP_ERR_NO_MEM;
     }
@@ -4239,6 +4793,7 @@ static esp_err_t perform_tts_request(const char *text, binary_buffer_t *audio_ou
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    http_client_destroy_proxy_transport(proxy_transport);
     free(payload);
 
     if (err != ESP_OK) {
@@ -6336,8 +6891,9 @@ static esp_err_t index_get_handler(httpd_req_t *req)
         "<option value='coingecko' %s>coingecko</option><option value='mock' %s>mock</option></select>"
         "<h3>Common</h3>"
         "<p class='muted'>每个 WiFi 的 Static IP/Gateway/DNS 在对应 WiFi 卡片里单独保存；留空就是 DHCP。</p>"
-        "<label>Proxy Host (saved, experimental)</label><input name='proxy_host' maxlength='63' value=\"%s\" placeholder='phone hotspot IP'>"
-        "<label>Proxy Port (saved, experimental)</label><input name='proxy_port' type='number' min='0' max='65535' value='%d'>"
+        "<p class='muted'>Clash/Meta 局域网共享请填代理 IP 和 mixed/http 端口；公网请求会走 HTTP CONNECT，局域网地址不走代理。</p>"
+        "<label>Clash Proxy Host</label><input name='proxy_host' maxlength='63' value=\"%s\" placeholder='192.168.43.1'>"
+        "<label>Clash Proxy Port</label><input name='proxy_port' type='number' min='0' max='65535' value='%d' placeholder='7890'>"
         "<label>Auto Sleep Seconds</label><input name='sleep' type='number' min='0' max='86400' value='%d'>"
         "<label>Brightness Percent</label><input name='brightness' type='number' min='5' max='100' value='%d'>"
         "<label>Shake Wake</label><select name='motion_wake'>"
