@@ -87,6 +87,7 @@ static bool s_ai_text_filter_enabled;
 #define DEFAULT_BRIGHTNESS_PERCENT 35
 #define DEFAULT_MOTION_WAKE_ENABLED 0
 #define DEFAULT_MOTION_WAKE_THRESHOLD_MG 2000
+#define HTTP_PROXY_FEATURE_ENABLED 0
 #define MIN_MOTION_WAKE_THRESHOLD_MG 600
 #define MAX_MOTION_WAKE_THRESHOLD_MG 6000
 #define DEEP_SLEEP_ENABLED 1
@@ -1435,7 +1436,8 @@ static void config_sanitize(watch_lite_config_t *cfg)
     cfg->static_gateway[sizeof(cfg->static_gateway) - 1] = '\0';
     cfg->dns1[sizeof(cfg->dns1) - 1] = '\0';
     cfg->dns2[sizeof(cfg->dns2) - 1] = '\0';
-    cfg->proxy_host[sizeof(cfg->proxy_host) - 1] = '\0';
+    cfg->proxy_host[0] = '\0';
+    cfg->proxy_port = 0;
 
     if (cfg->server_url[0] == '\0') {
         copy_string(cfg->server_url, sizeof(cfg->server_url), DEFAULT_API_URL);
@@ -1454,9 +1456,6 @@ static void config_sanitize(watch_lite_config_t *cfg)
     }
     if (cfg->auto_sleep_s < 0 || cfg->auto_sleep_s > MAX_AUTO_SLEEP_S) {
         cfg->auto_sleep_s = DEFAULT_AUTO_SLEEP_S;
-    }
-    if (cfg->proxy_port < 0 || cfg->proxy_port > 65535) {
-        cfg->proxy_port = 0;
     }
     if (cfg->brightness_percent < 5 || cfg->brightness_percent > 100) {
         cfg->brightness_percent = DEFAULT_BRIGHTNESS_PERCENT;
@@ -3313,6 +3312,10 @@ static bool proxy_should_use_for_url(const char *url, bool *use_tls_out)
     if (use_tls_out) {
         *use_tls_out = false;
     }
+#if !HTTP_PROXY_FEATURE_ENABLED
+    (void)url;
+    return false;
+#endif
     if (g_app.cfg.proxy_host[0] == '\0' || g_app.cfg.proxy_port <= 0) {
         return false;
     }
@@ -5393,20 +5396,8 @@ static bool update_crypto_market_row(int row_index, double price, double change_
 static esp_err_t market_http_request_auto(const char *url, char *body, size_t body_size)
 {
     memset(body, 0, body_size);
-    esp_err_t err = direct_http_request_no_proxy(url, NULL, DIRECT_HTTP_TIMEOUT_MS,
-                                                false, body, body_size);
-    if (err == ESP_OK) {
-        return ESP_OK;
-    }
-
-    if (g_app.cfg.proxy_host[0] == '\0' || g_app.cfg.proxy_port <= 0) {
-        return err;
-    }
-
-    ESP_LOGW(TAG, "market direct failed err=%s, trying proxy url=%s",
-             esp_err_to_name(err), url);
-    memset(body, 0, body_size);
-    return direct_http_request(url, NULL, DIRECT_HTTP_TIMEOUT_MS, false, body, body_size);
+    return direct_http_request_no_proxy(url, NULL, DIRECT_HTTP_TIMEOUT_MS,
+                                        false, body, body_size);
 }
 
 static int parse_coingecko_home_market(const char *body)
@@ -6888,7 +6879,6 @@ static esp_err_t index_get_handler(httpd_req_t *req)
     char ai_model[AI_PROFILE_COUNT][96] = {{0}};
     char prompt[256] = {0};
     char market_provider[32] = {0};
-    char proxy_host[96] = {0};
     char active_ssid[96] = {0};
     char preferred_ssid[96] = {0};
     html_escape(config_wifi_ssid_const(&g_app.cfg, 0), ssid1, sizeof(ssid1));
@@ -6915,7 +6905,6 @@ static esp_err_t index_get_handler(httpd_req_t *req)
         html_escape(net->dns1, slot_dns1[i], sizeof(slot_dns1[i]));
         html_escape(net->dns2, slot_dns2[i], sizeof(slot_dns2[i]));
     }
-    html_escape(g_app.cfg.proxy_host, proxy_host, sizeof(proxy_host));
     int active_slot = wifi_current_connected_slot();
     if (active_slot >= 0 && active_slot < WIFI_SLOT_COUNT) {
         html_escape(config_wifi_ssid_const(&g_app.cfg, active_slot),
@@ -7088,10 +7077,7 @@ static esp_err_t index_get_handler(httpd_req_t *req)
         "<option value='coingecko' %s>auto-cn</option><option value='mock' %s>mock</option></select>"
         "<h3>Common</h3>"
         "<p class='muted'>每个 WiFi 的 Static IP/Gateway/DNS 在对应 WiFi 卡片里单独保存；留空就是 DHCP。</p>"
-        "<p class='muted'>行情默认直连优先，BTC/ETH 先用 Gate/Huobi/Binance；直连失败且配置了 Clash 时才尝试代理。</p>"
-        "<p class='muted'>Clash/Meta 局域网共享请填代理 IP 和 mixed/http 端口；公网请求会走 HTTP CONNECT，局域网地址不走代理。</p>"
-        "<label>Clash Proxy Host</label><input name='proxy_host' maxlength='63' value=\"%s\" placeholder='192.168.43.1'>"
-        "<label>Clash Proxy Port</label><input name='proxy_port' type='number' min='0' max='65535' value='%d' placeholder='7890'>"
+        "<p class='muted'>行情默认直连，BTC/ETH 先用 Gate/Huobi/Binance；旧版保存过的 Clash 代理会自动清空。</p>"
         "<label>Auto Sleep Seconds</label><input name='sleep' type='number' min='0' max='86400' value='%d'>"
         "<label>Brightness Percent</label><input name='brightness' type='number' min='5' max='100' value='%d'>"
         "<label>Shake Wake</label><select name='motion_wake'>"
@@ -7102,7 +7088,7 @@ static esp_err_t index_get_handler(httpd_req_t *req)
         prompt,
         strcasecmp(market_provider, "coingecko") == 0 ? "selected" : "",
         strcasecmp(market_provider, "mock") == 0 ? "selected" : "",
-        proxy_host, g_app.cfg.proxy_port, g_app.cfg.auto_sleep_s,
+        g_app.cfg.auto_sleep_s,
         g_app.cfg.brightness_percent,
         g_app.cfg.motion_wake_enabled ? "selected" : "",
         g_app.cfg.motion_wake_enabled ? "" : "selected",
@@ -7314,7 +7300,8 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     form_update_string(body, "static_gateway", next.static_gateway, sizeof(next.static_gateway), false);
     form_update_string(body, "dns1", next.dns1, sizeof(next.dns1), false);
     form_update_string(body, "dns2", next.dns2, sizeof(next.dns2), false);
-    form_update_string(body, "proxy_host", next.proxy_host, sizeof(next.proxy_host), false);
+    next.proxy_host[0] = '\0';
+    next.proxy_port = 0;
     if (form_body_has_key(body, "static_ip") ||
         form_body_has_key(body, "static_netmask") ||
         form_body_has_key(body, "static_gateway") ||
@@ -7326,10 +7313,6 @@ static esp_err_t save_post_handler(httpd_req_t *req)
         copy_string(next.wifi_net[0].dns1, sizeof(next.wifi_net[0].dns1), next.dns1);
         copy_string(next.wifi_net[0].dns2, sizeof(next.wifi_net[0].dns2), next.dns2);
     }
-
-    strcpy(work, body);
-    form_get_value(work, "proxy_port", value, sizeof(value));
-    next.proxy_port = value[0] ? atoi(value) : 0;
 
     strcpy(work, body);
     form_get_value(work, "sleep", value, sizeof(value));
