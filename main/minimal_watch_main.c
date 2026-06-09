@@ -109,7 +109,6 @@ static bool s_ai_text_filter_enabled;
 #define DIRECT_HTTP_TIMEOUT_MS 12000
 #define DIRECT_AI_TIMEOUT_MS 35000
 #define DIRECT_HTTP_MAX_BODY 12288
-#define MARKET_HOME_YAHOO_MAX_PER_REFRESH 3
 #define VOICE_AI_TIMEOUT_MS 180000
 #define VOICE_GATEWAY_TIMEOUT_MS 45000
 #define VOICE_AUDIO_TIMEOUT_MS 30000
@@ -145,9 +144,11 @@ static bool s_ai_text_filter_enabled;
 #define GATE_TICKER_URL_FMT "https://api.gateio.ws/api/v4/spot/tickers?currency_pair=%s_USDT"
 #define HUOBI_TICKER_URL_FMT "https://api.huobi.pro/market/detail/merged?symbol=%susdt"
 #define BINANCE_TICKER_URL_FMT "https://api.binance.com/api/v3/ticker/24hr?symbol=%sUSDT"
+#define EASTMONEY_HOME_URL "https://push2delay.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f14,f2,f3,f4,f18,f152&secids=1.000001,100.HSI,100.N225,100.GDAXI,100.FTSE,100.SPX,100.NDX100,101.GC00Y,102.CL00Y,100.UDI,133.USDCNH,119.EURUSD"
+#define EASTMONEY_QUOTE_URL_FMT "https://push2delay.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f14,f2,f3,f4,f18,f152&secids=%s"
+#define SINA_VIX_URL "https://hq.sinajs.cn/list=b_VIX"
 #define STOOQ_QUOTE_URL_FMT "https://stooq.com/q/l/?s=%s&f=sd2t2ohlcv&h&e=csv"
 #define YAHOO_CHART_URL_FMT "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=30m"
-#define YAHOO_HOME_URL_FMT "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=1d"
 #define WIFI_CONNECT_WAIT_MS 15000
 #define WIFI_CONNECT_RETRY_MS 1600
 #define WIFI_SLOT_COUNT 5
@@ -473,7 +474,6 @@ typedef struct {
     int preferred_wifi_slot;
     int pending_wifi_slot;
     int active_wifi_slot;
-    int market_yahoo_next_index;
     int64_t last_market_refresh_us;
     int64_t last_activity_us;
     int64_t screen_sleep_started_us;
@@ -3788,6 +3788,13 @@ static esp_err_t direct_http_request_impl(const char *url, const char *payload, 
     }
     esp_http_client_set_header(client, "User-Agent", "Mozilla/5.0");
     esp_http_client_set_header(client, "Accept", "*/*");
+    if (strstr(url, "hq.sinajs.cn")) {
+        esp_http_client_set_header(client, "Referer", "https://finance.sina.com.cn/");
+    } else if (strstr(url, "eastmoney.com")) {
+        esp_http_client_set_header(client, "Referer", "https://quote.eastmoney.com/");
+    } else if (strstr(url, "qt.gtimg.cn")) {
+        esp_http_client_set_header(client, "Referer", "https://gu.qq.com/");
+    }
 
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
@@ -5377,7 +5384,7 @@ static bool json_item_to_double(cJSON *item, double *out)
     return false;
 }
 
-static bool update_crypto_market_row(int row_index, double price, double change_pct)
+static bool update_market_row_quote(int row_index, double price, double change_pct)
 {
     if (row_index < 0 || row_index >= MARKET_ROW_COUNT || price <= 0.0) {
         return false;
@@ -5393,11 +5400,266 @@ static bool update_crypto_market_row(int row_index, double price, double change_
     return true;
 }
 
+static bool update_crypto_market_row(int row_index, double price, double change_pct)
+{
+    return update_market_row_quote(row_index, price, change_pct);
+}
+
 static esp_err_t market_http_request_auto(const char *url, char *body, size_t body_size)
 {
     memset(body, 0, body_size);
     return direct_http_request_no_proxy(url, NULL, DIRECT_HTTP_TIMEOUT_MS,
                                         false, body, body_size);
+}
+
+static int row_index_from_eastmoney_code(const char *code)
+{
+    if (!code || !code[0]) {
+        return -1;
+    }
+    if (strcmp(code, "GC00Y") == 0) {
+        return 2;
+    }
+    if (strcmp(code, "CL00Y") == 0) {
+        return 3;
+    }
+    if (strcmp(code, "UDI") == 0) {
+        return 4;
+    }
+    if (strcmp(code, "USDCNH") == 0 || strcmp(code, "USDCNYC") == 0) {
+        return 5;
+    }
+    if (strcmp(code, "EURUSD") == 0) {
+        return 6;
+    }
+    if (strcmp(code, "000001") == 0) {
+        return 8;
+    }
+    if (strcmp(code, "HSI") == 0) {
+        return 9;
+    }
+    if (strcmp(code, "N225") == 0) {
+        return 10;
+    }
+    if (strcmp(code, "GDAXI") == 0) {
+        return 11;
+    }
+    if (strcmp(code, "FTSE") == 0) {
+        return 12;
+    }
+    if (strcmp(code, "SPX") == 0) {
+        return 13;
+    }
+    if (strcmp(code, "NDX100") == 0) {
+        return 14;
+    }
+    return -1;
+}
+
+static const char *eastmoney_secid_for_row(int row_index)
+{
+    switch (row_index) {
+    case 2:
+        return "101.GC00Y";
+    case 3:
+        return "102.CL00Y";
+    case 4:
+        return "100.UDI";
+    case 5:
+        return "133.USDCNH";
+    case 6:
+        return "119.EURUSD";
+    case 8:
+        return "1.000001";
+    case 9:
+        return "100.HSI";
+    case 10:
+        return "100.N225";
+    case 11:
+        return "100.GDAXI";
+    case 12:
+        return "100.FTSE";
+    case 13:
+        return "100.SPX";
+    case 14:
+        return "100.NDX100";
+    default:
+        return NULL;
+    }
+}
+
+static int parse_eastmoney_market(const char *body, int expected_row, double *last_price_out,
+                                  double *last_change_out)
+{
+    if (!body || !body[0]) {
+        return 0;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return 0;
+    }
+    cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
+    cJSON *diff = cJSON_IsObject(data) ? cJSON_GetObjectItemCaseSensitive(data, "diff") : NULL;
+    if (!cJSON_IsArray(diff)) {
+        cJSON_Delete(root);
+        return 0;
+    }
+
+    bool updated[MARKET_ROW_COUNT] = {0};
+    int ok_count = 0;
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, diff) {
+        cJSON *code = cJSON_GetObjectItemCaseSensitive(item, "f12");
+        cJSON *price_item = cJSON_GetObjectItemCaseSensitive(item, "f2");
+        cJSON *change_item = cJSON_GetObjectItemCaseSensitive(item, "f3");
+        if (!cJSON_IsString(code)) {
+            continue;
+        }
+        int row_index = row_index_from_eastmoney_code(code->valuestring);
+        if (expected_row >= 0 && row_index != expected_row) {
+            continue;
+        }
+        if (row_index < 0 || row_index >= MARKET_ROW_COUNT || updated[row_index]) {
+            continue;
+        }
+
+        double price = 0.0;
+        double change_pct = 0.0;
+        if (!json_item_to_double(price_item, &price) ||
+            !json_item_to_double(change_item, &change_pct) ||
+            !update_market_row_quote(row_index, price, change_pct)) {
+            continue;
+        }
+        updated[row_index] = true;
+        ok_count++;
+        if (last_price_out) {
+            *last_price_out = price;
+        }
+        if (last_change_out) {
+            *last_change_out = change_pct;
+        }
+    }
+
+    cJSON_Delete(root);
+    return ok_count;
+}
+
+static bool csv_field_to_double(const char *csv, int field_index, double *out)
+{
+    if (!csv || field_index < 0 || !out) {
+        return false;
+    }
+
+    const char *p = csv;
+    for (int i = 0; i < field_index; ++i) {
+        p = strchr(p, ',');
+        if (!p) {
+            return false;
+        }
+        p++;
+    }
+
+    char value[32] = {0};
+    size_t len = 0;
+    while (p[len] && p[len] != ',' && p[len] != '"' && p[len] != ';' && len < sizeof(value) - 1) {
+        value[len] = p[len];
+        len++;
+    }
+    if (len == 0) {
+        return false;
+    }
+
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+    if (!end || end == value) {
+        return false;
+    }
+    *out = parsed;
+    return true;
+}
+
+static const char *sina_quote_fields(const char *body, const char *code)
+{
+    if (!body || !code || !code[0]) {
+        return NULL;
+    }
+
+    char marker[48] = {0};
+    snprintf(marker, sizeof(marker), "hq_str_%s=\"", code);
+    const char *start = strstr(body, marker);
+    if (!start) {
+        return NULL;
+    }
+    start += strlen(marker);
+    return *start ? start : NULL;
+}
+
+static bool parse_sina_vix_market(const char *body, double *price_out, double *change_out)
+{
+    const char *fields = sina_quote_fields(body, "b_VIX");
+    if (!fields) {
+        return false;
+    }
+
+    double price = 0.0;
+    double change_pct = 0.0;
+    if (!csv_field_to_double(fields, 1, &price) ||
+        !csv_field_to_double(fields, 3, &change_pct)) {
+        return false;
+    }
+    if (!update_market_row_quote(7, price, change_pct)) {
+        return false;
+    }
+    if (price_out) {
+        *price_out = price;
+    }
+    if (change_out) {
+        *change_out = change_pct;
+    }
+    return true;
+}
+
+static void synthesize_quote_chart(double price, double change_pct)
+{
+    if (price <= 0.0) {
+        g_app.chart_point_count = 0;
+        return;
+    }
+
+    double previous = price;
+    double divisor = 1.0 + (change_pct / 100.0);
+    if (divisor > 0.05) {
+        previous = price / divisor;
+    }
+    if (previous <= 0.0) {
+        previous = price;
+    }
+
+    double delta = price - previous;
+    double wiggle = delta >= 0.0 ? delta * 0.08 : -delta * 0.08;
+    if (wiggle < price * 0.0008) {
+        wiggle = price * 0.0008;
+    }
+    for (int i = 0; i < CHART_POINT_COUNT; ++i) {
+        double t = (double)i / (double)(CHART_POINT_COUNT - 1);
+        double smooth = t * t * (3.0 - 2.0 * t);
+        double value = previous + delta * smooth;
+        int phase = i % 6;
+        double nudge = ((double)phase - 2.5) * wiggle * 0.08;
+        if (i == 0) {
+            value = previous;
+        } else if (i == CHART_POINT_COUNT - 1) {
+            value = price;
+        } else {
+            value += nudge;
+        }
+        if (value <= 0.0) {
+            value = price;
+        }
+        g_app.chart_values[i] = value;
+    }
+    g_app.chart_point_count = CHART_POINT_COUNT;
 }
 
 static int parse_coingecko_home_market(const char *body)
@@ -5586,6 +5848,56 @@ static int refresh_crypto_home_market(char *body, size_t body_size)
     return fallback_count > ok_count ? fallback_count : ok_count;
 }
 
+static int refresh_domestic_home_market(char *body, size_t body_size)
+{
+    int ok_count = 0;
+
+    if (market_http_request_auto(EASTMONEY_HOME_URL, body, body_size) == ESP_OK) {
+        ok_count += parse_eastmoney_market(body, -1, NULL, NULL);
+    }
+
+    if (market_http_request_auto(SINA_VIX_URL, body, body_size) == ESP_OK &&
+        parse_sina_vix_market(body, NULL, NULL)) {
+        ok_count++;
+    }
+
+    if (ok_count > 0) {
+        mark_market_time_now();
+    }
+    return ok_count;
+}
+
+static bool refresh_domestic_market_row(int row_index, char *body, size_t body_size,
+                                        bool update_chart)
+{
+    double price = 0.0;
+    double change_pct = 0.0;
+
+    const char *secid = eastmoney_secid_for_row(row_index);
+    if (secid) {
+        char url[224] = {0};
+        snprintf(url, sizeof(url), EASTMONEY_QUOTE_URL_FMT, secid);
+        if (market_http_request_auto(url, body, body_size) == ESP_OK &&
+            parse_eastmoney_market(body, row_index, &price, &change_pct) > 0) {
+            if (update_chart) {
+                synthesize_quote_chart(price, change_pct);
+            }
+            return true;
+        }
+    }
+
+    if (row_index == 7 &&
+        market_http_request_auto(SINA_VIX_URL, body, body_size) == ESP_OK &&
+        parse_sina_vix_market(body, &price, &change_pct)) {
+        if (update_chart) {
+            synthesize_quote_chart(price, change_pct);
+        }
+        return true;
+    }
+
+    return false;
+}
+
 static bool parse_gateway_market_full(const char *body)
 {
     if (!body || !body[0]) {
@@ -5700,36 +6012,11 @@ static void home_market_refresh_task(void *arg)
         ui_refresh_now();
     }
 
-    int yahoo_tries = 0;
-    const int yahoo_start_index = ok_count > 0 ? 2 : 0;
-    int yahoo_index = ok_count > 0 ? g_app.market_yahoo_next_index : 0;
-    if (yahoo_index < yahoo_start_index || yahoo_index >= MARKET_ROW_COUNT) {
-        yahoo_index = yahoo_start_index;
-    }
-    for (int visited = 0; visited < MARKET_ROW_COUNT - yahoo_start_index; visited++) {
-        if (yahoo_tries >= MARKET_HOME_YAHOO_MAX_PER_REFRESH) {
-            break;
-        }
-        int i = yahoo_index + visited;
-        if (i >= MARKET_ROW_COUNT) {
-            i = yahoo_start_index + (i - MARKET_ROW_COUNT);
-        }
-        char url[192] = {0};
-        snprintf(url, sizeof(url), YAHOO_HOME_URL_FMT, MARKET_DEFS[i].chart_symbol);
-        memset(body, 0, DIRECT_HTTP_MAX_BODY + 1);
-        yahoo_tries++;
-        esp_err_t err = market_http_request_auto(url, body, DIRECT_HTTP_MAX_BODY + 1);
-        if (err == ESP_OK && parse_yahoo_chart(body, i, false)) {
-            ok_count++;
-            snprintf(g_app.market_status, sizeof(g_app.market_status), "%d/%d", ok_count, MARKET_ROW_COUNT);
-            ui_refresh_now();
-        }
-    }
-    if (ok_count > 0 && yahoo_tries > 0) {
-        g_app.market_yahoo_next_index = yahoo_index + yahoo_tries;
-        if (g_app.market_yahoo_next_index >= MARKET_ROW_COUNT) {
-            g_app.market_yahoo_next_index = 2;
-        }
+    int domestic_count = refresh_domestic_home_market(body, DIRECT_HTTP_MAX_BODY + 1);
+    if (domestic_count > 0) {
+        ok_count += domestic_count;
+        snprintf(g_app.market_status, sizeof(g_app.market_status), "CN %d", ok_count);
+        ui_refresh_now();
     }
 
     if (ok_count > 0) {
@@ -6668,13 +6955,16 @@ static void chart_refresh_task(void *arg)
         return;
     }
 
-    char url[192] = {0};
-    snprintf(url, sizeof(url), YAHOO_CHART_URL_FMT, MARKET_DEFS[row_index].chart_symbol);
     copy_string(g_app.chart_hint, sizeof(g_app.chart_hint), "Loading");
     ui_refresh_now();
 
-    esp_err_t err = market_http_request_auto(url, body, DIRECT_HTTP_MAX_BODY + 1);
-    bool parsed = err == ESP_OK && parse_yahoo_chart(body, row_index, true);
+    bool parsed = refresh_domestic_market_row(row_index, body, DIRECT_HTTP_MAX_BODY + 1, true);
+    if (!parsed) {
+        char url[192] = {0};
+        snprintf(url, sizeof(url), YAHOO_CHART_URL_FMT, MARKET_DEFS[row_index].chart_symbol);
+        esp_err_t err = market_http_request_auto(url, body, DIRECT_HTTP_MAX_BODY + 1);
+        parsed = err == ESP_OK && parse_yahoo_chart(body, row_index, true);
+    }
     if (parsed) {
         mark_market_time_now();
         g_app.market_polled_once = true;
@@ -7077,7 +7367,7 @@ static esp_err_t index_get_handler(httpd_req_t *req)
         "<option value='coingecko' %s>auto-cn</option><option value='mock' %s>mock</option></select>"
         "<h3>Common</h3>"
         "<p class='muted'>每个 WiFi 的 Static IP/Gateway/DNS 在对应 WiFi 卡片里单独保存；留空就是 DHCP。</p>"
-        "<p class='muted'>行情默认直连，BTC/ETH 先用 Gate/Huobi/Binance；旧版保存过的 Clash 代理会自动清空。</p>"
+        "<p class='muted'>行情默认直连，BTC/ETH 走 Gate/Huobi/Binance，指数/黄金/原油/外汇走东方财富/新浪；旧版保存过的 Clash 代理会自动清空。</p>"
         "<label>Auto Sleep Seconds</label><input name='sleep' type='number' min='0' max='86400' value='%d'>"
         "<label>Brightness Percent</label><input name='brightness' type='number' min='5' max='100' value='%d'>"
         "<label>Shake Wake</label><select name='motion_wake'>"

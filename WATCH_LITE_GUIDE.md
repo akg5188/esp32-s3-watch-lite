@@ -9,7 +9,7 @@
 
 首页显示行情列表、Wi-Fi 状态、时间、电量信息。手表联网后会刷新行情；如果短时间内网络不通，会先显示上次缓存。
 
-目前行情来源包括 CoinGecko、Stooq 和 Yahoo Chart。周末或海外源不可用时，部分股票/指数可能停留在上一次交易日数据，这是正常现象。
+目前首页行情优先使用国内网络更容易访问的直连源：BTC/ETH 走 Gate、Huobi、Binance，指数、黄金、原油和外汇走东方财富/新浪。周末或休市时，部分品种可能停留在上一次交易日数据，这是正常现象。
 
 ## AI 页面
 
@@ -59,7 +59,7 @@ Model: 方舟控制台里启用的豆包模型或 endpoint id
 
 ## 国内网络行情
 
-行情刷新默认直连，不再依赖 Clash/Meta 局域网共享。`BTC / ETH` 会优先使用 Gate、Huobi、Binance 的公开 ticker，减少对 CoinGecko 的依赖；黄金、外汇和指数仍使用原来的金融行情源。
+行情刷新默认直连，不再依赖 Clash/Meta 局域网共享。`BTC / ETH` 会优先使用 Gate、Huobi、Binance 的公开 ticker；`XAU / WTI / DXY / CNY / EUR / VIX / SHC / HSI / N225 / DAX / UKX / SPX / NDX` 会优先使用东方财富/新浪接口，减少 Yahoo 在国内网络返回 403 的问题。
 
 ## 省电行为
 
