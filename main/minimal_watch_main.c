@@ -107,8 +107,10 @@ static bool s_ai_text_filter_enabled;
 
 #define MARKET_WAIT_INTERVAL_MS 2000
 #define DIRECT_HTTP_TIMEOUT_MS 12000
+#define MARKET_FAST_HTTP_TIMEOUT_MS 5000
 #define DIRECT_AI_TIMEOUT_MS 35000
 #define DIRECT_HTTP_MAX_BODY 12288
+#define MARKET_FAST_TLS_WAIT_MS 4000
 #define VOICE_AI_TIMEOUT_MS 180000
 #define VOICE_GATEWAY_TIMEOUT_MS 45000
 #define VOICE_AUDIO_TIMEOUT_MS 30000
@@ -141,12 +143,13 @@ static bool s_ai_text_filter_enabled;
 #define VOICE_TRY_COMBINED_GATEWAY 1
 #define SETUP_PAGE_MAX 24000
 #define COINGECKO_MARKET_URL "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"
+#define GATE_LEGACY_TICKER_URL_FMT "http://data.gateapi.io/api2/1/ticker/%s_USDT"
 #define GATE_TICKER_URL_FMT "https://api.gateio.ws/api/v4/spot/tickers?currency_pair=%s_USDT"
 #define HUOBI_TICKER_URL_FMT "https://api.huobi.pro/market/detail/merged?symbol=%susdt"
 #define BINANCE_TICKER_URL_FMT "https://api.binance.com/api/v3/ticker/24hr?symbol=%sUSDT"
-#define EASTMONEY_HOME_URL "https://push2delay.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f14,f2,f3,f4,f18,f152&secids=1.000001,100.HSI,100.N225,100.GDAXI,100.FTSE,100.SPX,100.NDX100,101.GC00Y,102.CL00Y,100.UDI,133.USDCNH,119.EURUSD"
-#define EASTMONEY_QUOTE_URL_FMT "https://push2delay.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f14,f2,f3,f4,f18,f152&secids=%s"
-#define SINA_VIX_URL "https://hq.sinajs.cn/list=b_VIX"
+#define EASTMONEY_HOME_URL "http://push2delay.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f14,f2,f3,f4,f18,f152&secids=1.000001,100.HSI,100.N225,100.GDAXI,100.FTSE,100.SPX,100.NDX100,101.GC00Y,102.CL00Y,100.UDI,133.USDCNH,119.EURUSD"
+#define EASTMONEY_QUOTE_URL_FMT "http://push2delay.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2&fields=f12,f14,f2,f3,f4,f18,f152&secids=%s"
+#define SINA_VIX_URL "http://hq.sinajs.cn/list=b_VIX"
 #define STOOQ_QUOTE_URL_FMT "https://stooq.com/q/l/?s=%s&f=sd2t2ohlcv&h&e=csv"
 #define YAHOO_CHART_URL_FMT "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=30m"
 #define WIFI_CONNECT_WAIT_MS 15000
@@ -5411,11 +5414,22 @@ static bool update_crypto_market_row(int row_index, double price, double change_
     return update_market_row_quote(row_index, price, change_pct);
 }
 
-static esp_err_t market_http_request_auto(const char *url, char *body, size_t body_size)
+static esp_err_t market_http_request_with_timeout(const char *url, int timeout_ms,
+                                                  char *body, size_t body_size)
 {
     memset(body, 0, body_size);
-    return direct_http_request_no_proxy(url, NULL, DIRECT_HTTP_TIMEOUT_MS,
+    return direct_http_request_no_proxy(url, NULL, timeout_ms,
                                         false, body, body_size);
+}
+
+static esp_err_t market_http_request_auto(const char *url, char *body, size_t body_size)
+{
+    return market_http_request_with_timeout(url, DIRECT_HTTP_TIMEOUT_MS, body, body_size);
+}
+
+static esp_err_t market_http_request_fast(const char *url, char *body, size_t body_size)
+{
+    return market_http_request_with_timeout(url, MARKET_FAST_HTTP_TIMEOUT_MS, body, body_size);
 }
 
 static int row_index_from_eastmoney_code(const char *code)
@@ -5780,6 +5794,55 @@ static bool parse_binance_crypto_ticker(const char *body, int row_index)
     return ok;
 }
 
+static bool parse_gate_legacy_crypto_ticker(const char *body, int row_index)
+{
+    if (!body || !body[0]) {
+        return false;
+    }
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return false;
+    }
+    cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "result");
+    cJSON *last = cJSON_GetObjectItemCaseSensitive(root, "last");
+    cJSON *change = cJSON_GetObjectItemCaseSensitive(root, "percentChange");
+    double price = 0.0;
+    double change_pct = 0.0;
+    bool result_ok = cJSON_IsBool(result) ? cJSON_IsTrue(result) :
+                     (cJSON_IsString(result) && strcmp(result->valuestring, "true") == 0);
+    bool ok = result_ok &&
+              json_item_to_double(last, &price) &&
+              json_item_to_double(change, &change_pct) &&
+              update_crypto_market_row(row_index, price, change_pct);
+    cJSON_Delete(root);
+    return ok;
+}
+
+static int refresh_fast_crypto_home_market(char *body, size_t body_size)
+{
+    struct {
+        int row_index;
+        const char *base_symbol;
+    } coins[] = {
+        {0, "BTC"},
+        {1, "ETH"},
+    };
+
+    int ok_count = 0;
+    for (size_t i = 0; i < sizeof(coins) / sizeof(coins[0]); ++i) {
+        char url[160] = {0};
+        snprintf(url, sizeof(url), GATE_LEGACY_TICKER_URL_FMT, coins[i].base_symbol);
+        if (market_http_request_fast(url, body, body_size) == ESP_OK &&
+            parse_gate_legacy_crypto_ticker(body, coins[i].row_index)) {
+            ok_count++;
+        }
+    }
+    if (ok_count > 0) {
+        mark_market_time_now();
+    }
+    return ok_count;
+}
+
 static bool refresh_crypto_row_from_regional_sources(int row_index, const char *base_symbol,
                                                      char *body, size_t body_size)
 {
@@ -5858,11 +5921,11 @@ static int refresh_domestic_home_market(char *body, size_t body_size)
 {
     int ok_count = 0;
 
-    if (market_http_request_auto(EASTMONEY_HOME_URL, body, body_size) == ESP_OK) {
+    if (market_http_request_fast(EASTMONEY_HOME_URL, body, body_size) == ESP_OK) {
         ok_count += parse_eastmoney_market(body, -1, NULL, NULL);
     }
 
-    if (market_http_request_auto(SINA_VIX_URL, body, body_size) == ESP_OK &&
+    if (market_http_request_fast(SINA_VIX_URL, body, body_size) == ESP_OK &&
         parse_sina_vix_market(body, NULL, NULL)) {
         ok_count++;
     }
@@ -5996,8 +6059,6 @@ static void home_market_refresh_task(void *arg)
         return;
     }
 
-    wait_for_clock_once(12000);
-
     char *body = http_body_alloc(DIRECT_HTTP_MAX_BODY + 1);
     if (!body) {
         copy_string(g_app.market_status, sizeof(g_app.market_status), "NO MEM");
@@ -6012,9 +6073,11 @@ static void home_market_refresh_task(void *arg)
         return;
     }
 
-    int ok_count = refresh_crypto_home_market(body, DIRECT_HTTP_MAX_BODY + 1);
-    if (ok_count > 0) {
-        snprintf(g_app.market_status, sizeof(g_app.market_status), "CN %d", ok_count);
+    int ok_count = 0;
+    int fast_crypto_count = refresh_fast_crypto_home_market(body, DIRECT_HTTP_MAX_BODY + 1);
+    if (fast_crypto_count > 0) {
+        ok_count = fast_crypto_count;
+        snprintf(g_app.market_status, sizeof(g_app.market_status), "CR %d", ok_count);
         ui_refresh_now();
     }
 
@@ -6023,6 +6086,26 @@ static void home_market_refresh_task(void *arg)
         ok_count += domestic_count;
         snprintf(g_app.market_status, sizeof(g_app.market_status), "CN %d", ok_count);
         ui_refresh_now();
+    }
+
+    if (ok_count < MARKET_ROW_COUNT) {
+        wait_for_clock_once(MARKET_FAST_TLS_WAIT_MS);
+        int crypto_count = refresh_crypto_home_market(body, DIRECT_HTTP_MAX_BODY + 1);
+        int missing_crypto = 2 - fast_crypto_count;
+        if (missing_crypto < 0) {
+            missing_crypto = 0;
+        }
+        if (crypto_count > missing_crypto) {
+            crypto_count = missing_crypto;
+        }
+        ok_count += crypto_count;
+        if (ok_count > MARKET_ROW_COUNT) {
+            ok_count = MARKET_ROW_COUNT;
+        }
+        if (ok_count > 0) {
+            snprintf(g_app.market_status, sizeof(g_app.market_status), "CN %d", ok_count);
+            ui_refresh_now();
+        }
     }
 
     if (ok_count > 0) {
