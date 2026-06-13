@@ -8478,6 +8478,15 @@ static esp_err_t wifi_apply_sta_slot(int slot)
     return esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
 }
 
+static bool wifi_disconnect_reason_is_fast_fail(uint8_t reason)
+{
+    return reason == WIFI_REASON_NO_AP_FOUND ||
+           reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY ||
+           reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD ||
+           reason == WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD ||
+           reason == WIFI_REASON_AUTH_FAIL;
+}
+
 static esp_err_t wifi_sta_connect_once(int timeout_ms)
 {
     if (!g_app.wifi_started || !g_app.sta_configured) {
@@ -8542,7 +8551,7 @@ static esp_err_t wifi_sta_connect_once(int timeout_ms)
             waited_ms += 200;
             retry_ms += 200;
             if (!g_app.sta_connected && !g_app.sta_link_connected &&
-                g_app.sta_disconnect_reason != 0) {
+                wifi_disconnect_reason_is_fast_fail(g_app.sta_disconnect_reason)) {
                 ESP_LOGI(TAG, "sta slot %d failed early reason=%u",
                          slot + 1, (unsigned)g_app.sta_disconnect_reason);
                 break;
