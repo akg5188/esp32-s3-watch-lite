@@ -8562,6 +8562,16 @@ static esp_err_t wifi_sta_connect_once(int timeout_ms)
         if (g_app.sta_connected) {
             g_app.active_wifi_slot = slot;
             g_app.pending_wifi_slot = -1;
+            if (g_app.preferred_wifi_slot != slot) {
+                esp_err_t pref_err = wifi_preferred_slot_save(slot);
+                if (pref_err == ESP_OK) {
+                    g_app.preferred_wifi_slot = slot;
+                    ESP_LOGI(TAG, "wifi: preferred slot updated to %d", slot + 1);
+                } else {
+                    ESP_LOGW(TAG, "wifi: preferred slot save failed: %s",
+                             esp_err_to_name(pref_err));
+                }
+            }
             return ESP_OK;
         }
         last_err = ESP_ERR_TIMEOUT;
