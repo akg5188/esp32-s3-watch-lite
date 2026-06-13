@@ -6,6 +6,7 @@
 
 - 首页显示 `BTC / ETH / XAU / WTI / DXY / CNY / EUR / VIX / SHC / HSI / N225 / DAX / UKX / SPX / NDX`，支持联网刷新和本地缓存。
 - 国内网络优先行情：`BTC / ETH` 先走 Gate/Huobi/Binance，指数、黄金、原油和外汇走东方财富/新浪直连，不再依赖 Clash 共享。
+- 开机/电源键唤醒后会尽早启动 Wi-Fi 和行情刷新，减少等待首页更新的时间。
 - AI 页面支持中文显示、语音输入、TTS 播放、多 AI Profile 切换；文本聊天可直接配置 GPT、Gemini、豆包、DeepSeek、千问等兼容接口。
 - 支持最多 5 个 Wi-Fi 配置，每个 Wi-Fi 可保存独立静态 IP、网关、DNS。
 - 配置热点平时关闭省电；短按 BOOT 唤醒并刷新，长按 BOOT 约 2 秒打开配置热点。

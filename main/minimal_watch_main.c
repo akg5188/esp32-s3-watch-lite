@@ -447,10 +447,13 @@ typedef struct {
     char sta_ip[16];
     bool sta_configured;
     bool sta_connected;
+    bool sta_link_connected;
     bool sta_connect_requested;
+    uint8_t sta_disconnect_reason;
     bool wifi_started;
     bool ap_started;
     bool ap_config_enabled;
+    bool ui_ready;
     bool sntp_started;
     bool screen_sleeping;
     bool worker_started;
@@ -2546,6 +2549,9 @@ static void ui_refresh_locked(void)
 
 static void ui_refresh_now(void)
 {
+    if (!g_app.ui_ready) {
+        return;
+    }
     if (!bsp_display_lock(100)) {
         return;
     }
@@ -8384,7 +8390,7 @@ static esp_err_t wifi_apply_sta_slot(int slot)
     copy_string((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), ssid);
     copy_string((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), password);
     sta_cfg.sta.threshold.authmode = password && password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
     sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     return esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
 }
@@ -8418,6 +8424,8 @@ static esp_err_t wifi_sta_connect_once(int timeout_ms)
         g_app.sta_connect_requested = false;
         (void)esp_wifi_disconnect();
         g_app.sta_connected = false;
+        g_app.sta_link_connected = false;
+        g_app.sta_disconnect_reason = 0;
         g_app.active_wifi_slot = -1;
         g_app.sta_ip[0] = '\0';
         vTaskDelay(pdMS_TO_TICKS(120));
@@ -8434,6 +8442,7 @@ static esp_err_t wifi_sta_connect_once(int timeout_ms)
         ESP_LOGI(TAG, "trying WiFi slot %d ssid=%s", slot + 1,
                  config_wifi_ssid_const(&g_app.cfg, slot));
         g_app.sta_connect_requested = true;
+        g_app.sta_disconnect_reason = 0;
         g_app.pending_wifi_slot = slot;
         err = esp_wifi_connect();
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
@@ -8449,7 +8458,14 @@ static esp_err_t wifi_sta_connect_once(int timeout_ms)
             vTaskDelay(pdMS_TO_TICKS(200));
             waited_ms += 200;
             retry_ms += 200;
-            if (!g_app.sta_connected && retry_ms >= WIFI_CONNECT_RETRY_MS) {
+            if (!g_app.sta_connected && !g_app.sta_link_connected &&
+                g_app.sta_disconnect_reason != 0) {
+                ESP_LOGI(TAG, "sta slot %d failed early reason=%u",
+                         slot + 1, (unsigned)g_app.sta_disconnect_reason);
+                break;
+            }
+            if (!g_app.sta_connected && !g_app.sta_link_connected &&
+                retry_ms >= WIFI_CONNECT_RETRY_MS) {
                 retry_ms = 0;
                 ESP_LOGI(TAG, "retry WiFi slot %d ssid=%s", slot + 1,
                          config_wifi_ssid_const(&g_app.cfg, slot));
@@ -8481,6 +8497,8 @@ static void wifi_sta_disconnect_now(void)
         (void)esp_wifi_disconnect();
     }
     g_app.sta_connected = false;
+    g_app.sta_link_connected = false;
+    g_app.sta_disconnect_reason = 0;
     g_app.pending_wifi_slot = -1;
     g_app.active_wifi_slot = -1;
     g_app.sta_ip[0] = '\0';
@@ -8562,8 +8580,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         if (g_app.sta_configured && g_app.sta_connect_requested) {
             esp_wifi_connect();
         }
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        g_app.sta_link_connected = true;
+        g_app.sta_disconnect_reason = 0;
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)data;
         g_app.sta_connected = false;
+        g_app.sta_link_connected = false;
+        g_app.sta_disconnect_reason = event ? event->reason : 0;
         g_app.active_wifi_slot = -1;
         g_app.sta_ip[0] = '\0';
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_START) {
@@ -8691,6 +8715,15 @@ void app_main(void)
     }
     g_app.last_activity_us = esp_timer_get_time();
 
+    esp_err_t wifi_err = wifi_start();
+    if (wifi_err != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi failed: %s", esp_err_to_name(wifi_err));
+    }
+    if (g_app.ap_config_enabled) {
+        http_server_start();
+    }
+    home_market_refresh_async();
+
     lv_display_t *display = bsp_display_start();
     if (!display) {
         ESP_LOGE(TAG, "Display init failed");
@@ -8706,6 +8739,8 @@ void app_main(void)
         ui_create_chart();
         ui_show_home();
         lv_timer_create(ui_timer_cb, 1000, NULL);
+        g_app.ui_ready = true;
+        ui_refresh_locked();
         bsp_display_unlock();
     } else {
         ESP_LOGE(TAG, "LVGL lock failed");
@@ -8716,16 +8751,8 @@ void app_main(void)
         battery_update_once();
     }
 
-    esp_err_t wifi_err = wifi_start();
-    if (wifi_err != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi failed: %s", esp_err_to_name(wifi_err));
-    }
-    if (g_app.ap_config_enabled) {
-        http_server_start();
-    }
     motion_task_start_once();
     boot_button_task_start_once();
-    home_market_refresh_async();
     ui_refresh_now();
 
     while (true) {
